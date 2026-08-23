@@ -1,6 +1,7 @@
 
 *.vsidx
 *.db
+*.o
 .vs/*
 bin/*
 br.bat

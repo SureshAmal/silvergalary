@@ -39,6 +39,11 @@ public:
         FILE* f = (fontPath && fontPath[0] != '\0') ? fopen(fontPath, "rb") : nullptr;
         if (!f) {
             const char* fallbacks[] = {
+                // Windows System Fonts
+                "C:\\Windows\\Fonts\\segoeui.ttf",
+                "C:\\Windows\\Fonts\\arial.ttf",
+                "C:\\Windows\\Fonts\\calibri.ttf",
+                "C:\\Windows\\Fonts\\tahoma.ttf",
                 // Fedora / RHEL
                 "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf",
                 "/usr/share/fonts/google-carlito-fonts/Carlito-Regular.ttf",

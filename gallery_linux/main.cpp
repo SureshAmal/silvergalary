@@ -5,9 +5,14 @@
 #include <string>
 #include <chrono>
 #include <cstdlib>
+#include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
@@ -60,6 +65,10 @@ static void refreshRecords() {
 static void launchViewer(const std::string& path) {
     if (path.empty()) return;
 
+#ifdef _WIN32
+    std::string cmd = "silver_viewer.exe \"" + path + "\"";
+    WinExec(cmd.c_str(), SW_SHOWNORMAL);
+#else
     pid_t pid = fork();
     if (pid == 0) {
         std::string viewerBin = "./bin/silver_viewer";
@@ -75,15 +84,14 @@ static void launchViewer(const std::string& path) {
         execlp(viewerBin.c_str(), viewerBin.c_str(), path.c_str(), nullptr);
         _exit(1);
     }
+#endif
 }
 
 static void copyPathToClipboard(const std::string& path) {
     if (path.empty()) return;
-    std::thread([path]() {
-        std::string cmd = "printf '%s' \"" + path + "\" | wl-copy 2>/dev/null || printf '%s' \"" + path + "\" | xclip -selection clipboard 2>/dev/null";
-        int res = system(cmd.c_str());
-        (void)res;
-    }).detach();
+    if (g_gal.window) {
+        glfwSetClipboardString(g_gal.window, path.c_str());
+    }
     std::cout << "Copied to clipboard: " << path << std::endl;
 }
 

@@ -8,11 +8,14 @@
 #include <iostream>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <unistd.h>
 #include <pwd.h>
+#endif
 #include <ctime>
 #include <cstring>
 #include <algorithm>
+#include <filesystem>
 
 struct GalleryRecord {
     int64_t id = 0;
@@ -45,6 +48,14 @@ public:
     }
 
     static std::string getDefaultDbPath() {
+#ifdef _WIN32
+        const char* appData = getenv("APPDATA");
+        std::string baseDir = (appData && appData[0] != '\0') ? appData : "C:\\ProgramData";
+        std::string galDir = baseDir + "\\SilverGallery";
+        std::error_code ec;
+        std::filesystem::create_directories(galDir, ec);
+        return galDir + "\\index.db";
+#else
         const char* xdgCache = getenv("XDG_CACHE_HOME");
         std::string baseDir;
         if (xdgCache && xdgCache[0] != '\0') {
@@ -59,17 +70,18 @@ public:
         }
 
         std::string galDir = baseDir + "/silver_gallery";
-        mkdir(baseDir.c_str(), 0755);
-        mkdir(galDir.c_str(), 0755);
+        std::error_code ec;
+        std::filesystem::create_directories(galDir, ec);
 
         // Seamless migration from old path if present
         std::string oldGalDir = baseDir + "/cactus_gallery";
         std::string oldDb = oldGalDir + "/index.db";
         std::string newDb = galDir + "/index.db";
-        if (access(newDb.c_str(), F_OK) != 0 && access(oldDb.c_str(), F_OK) == 0) {
-            rename(oldDb.c_str(), newDb.c_str());
+        if (std::filesystem::exists(oldDb, ec) && !std::filesystem::exists(newDb, ec)) {
+            std::filesystem::rename(oldDb, newDb, ec);
         }
         return newDb;
+#endif
     }
 
     bool init(const std::string& path = "") {

@@ -39,6 +39,18 @@ public:
 
     void discoverDefaultRoots() {
         searchRoots.clear();
+#ifdef _WIN32
+        const char* userProfile = getenv("USERPROFILE");
+        std::string homeStr = userProfile ? userProfile : "C:\\";
+        std::vector<std::string> candidates = {
+            homeStr + "\\Pictures",
+            homeStr + "\\Downloads",
+            homeStr + "\\Documents",
+            homeStr + "\\Desktop",
+            homeStr + "\\Photos",
+            homeStr + "\\OneDrive\\Pictures"
+        };
+#else
         const char* home = getenv("HOME");
         if (!home) {
             struct passwd* pw = getpwuid(getuid());
@@ -55,6 +67,7 @@ public:
             homeStr + "/Photos",
             "/usr/share/backgrounds"
         };
+#endif
 
         for (const auto& dir : candidates) {
             std::error_code ec;

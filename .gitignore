@@ -1,0 +1,8 @@
+
+*.vsidx
+*.db
+.vs/*
+bin/*
+br.bat
+installer/*
+/installer

@@ -34,6 +34,17 @@ struct GalleryRecord {
     int day = 1;
     std::string dateLabel;
     int starred = 0;
+
+    // An 8x8 RGB thumbnail of the photo, 192 bytes, stored inline.
+    //
+    // Upscaled with bilinear filtering this reads as a blurred impression of
+    // the image - enough that a cold grid paints something recognisable
+    // immediately instead of empty rectangles while thumbnails decode. Fixed
+    // size and inline so it costs no allocation per record.
+    static const int kPreviewDim = 8;
+    static const int kPreviewBytes = kPreviewDim * kPreviewDim * 3;
+    bool hasPreview = false;
+    unsigned char preview[kPreviewBytes] = {0};
 };
 
 class GalleryDatabase {
@@ -106,6 +117,7 @@ public:
         sqlite3_exec(db, "PRAGMA synchronous = NORMAL;", nullptr, nullptr, nullptr);
         sqlite3_exec(db, "PRAGMA cache_size = -64000;", nullptr, nullptr, nullptr); // 64MB cache
         sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", nullptr, nullptr, nullptr);
+        sqlite3_exec(db, "PRAGMA mmap_size = 268435456;", nullptr, nullptr, nullptr); // 256MB mmap reads
 
         const char* schema = R"(
             CREATE TABLE IF NOT EXISTS gallery_items (
@@ -124,7 +136,8 @@ public:
                 month INTEGER NOT NULL,
                 day INTEGER NOT NULL,
                 date_label TEXT NOT NULL,
-                starred INTEGER DEFAULT 0
+                starred INTEGER DEFAULT 0,
+                preview BLOB
             );
 
             CREATE INDEX IF NOT EXISTS idx_gallery_capture ON gallery_items(capture_time DESC);
@@ -139,6 +152,31 @@ public:
             std::cerr << "[GalleryDB] Schema creation error: " << (errMsg ? errMsg : "unknown") << std::endl;
             if (errMsg) sqlite3_free(errMsg);
             return false;
+        }
+
+        // Schema/indexer migrations. Version 2 introduced WebP / SVG / AVIF
+        // dimension probing, so rows an older build left dimensionless are
+        // dropped and picked up again by the next scan.
+        int userVersion = 0;
+        {
+            sqlite3_stmt* stmt = nullptr;
+            if (sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, nullptr) == SQLITE_OK) {
+                if (sqlite3_step(stmt) == SQLITE_ROW) userVersion = sqlite3_column_int(stmt, 0);
+                sqlite3_finalize(stmt);
+            }
+        }
+        if (userVersion < 2) {
+            sqlite3_exec(db, "DELETE FROM gallery_items WHERE width <= 0 OR height <= 0;",
+                         nullptr, nullptr, nullptr);
+            sqlite3_exec(db, "PRAGMA user_version = 2;", nullptr, nullptr, nullptr);
+        }
+        if (userVersion < 3) {
+            // Added for the blurred placeholders. An existing table needs the
+            // column; a freshly created one already has it, so the error is
+            // expected and ignored.
+            sqlite3_exec(db, "ALTER TABLE gallery_items ADD COLUMN preview BLOB;",
+                         nullptr, nullptr, nullptr);
+            sqlite3_exec(db, "PRAGMA user_version = 3;", nullptr, nullptr, nullptr);
         }
 
         return true;
@@ -271,22 +309,79 @@ public:
         return true;
     }
 
+    // Store the blurred placeholders generated while thumbnails were decoded.
+    bool storePreviews(const std::vector<std::pair<std::string, std::vector<unsigned char>>>& previews) {
+        if (previews.empty()) return true;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!db) return false;
+
+        sqlite3_exec(db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+
+        const char* sql = "UPDATE gallery_items SET preview = ? WHERE path = ?;";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+            return false;
+        }
+
+        for (const auto& kv : previews) {
+            if ((int)kv.second.size() != GalleryRecord::kPreviewBytes) continue;
+            sqlite3_bind_blob(stmt, 1, kv.second.data(), (int)kv.second.size(), SQLITE_STATIC);
+            sqlite3_bind_text(stmt, 2, kv.first.c_str(), -1, SQLITE_STATIC);
+            sqlite3_step(stmt);
+            sqlite3_reset(stmt);
+        }
+
+        sqlite3_finalize(stmt);
+        sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+        return true;
+    }
+
+    bool deletePaths(const std::vector<std::string>& paths) {
+        if (paths.empty()) return true;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!db) return false;
+
+        sqlite3_exec(db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+
+        const char* sql = "DELETE FROM gallery_items WHERE path = ?;";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+            return false;
+        }
+
+        for (const auto& p : paths) {
+            sqlite3_bind_text(stmt, 1, p.c_str(), -1, SQLITE_STATIC);
+            sqlite3_step(stmt);
+            sqlite3_reset(stmt);
+        }
+
+        sqlite3_finalize(stmt);
+        sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+        return true;
+    }
+
     std::vector<GalleryRecord> fetchAllSorted(const std::string& searchQuery = "",
                                               bool onlyStarred = false,
-                                              const std::string& folderFilter = "") {
+                                              const std::string& folderFilter = "",
+                                              bool folderRecursive = false) {
         std::vector<GalleryRecord> results;
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!db) return results;
 
         std::string sql = "SELECT id, path, folder, filename, file_size, file_type, width, height, "
-                          "modified_time, created_time, capture_time, year, month, day, date_label, starred "
-                          "FROM gallery_items WHERE 1=1 ";
+                          "modified_time, created_time, capture_time, year, month, day, date_label, starred, "
+                          "preview FROM gallery_items WHERE 1=1 ";
 
         if (onlyStarred) {
             sql += " AND starred = 1 ";
         }
         if (!folderFilter.empty()) {
-            sql += " AND folder = ? ";
+            // Recursive means "this directory and everything under it", which is
+            // what selecting a parent in the folder tree should show.
+            sql += folderRecursive ? " AND (folder = ? OR folder LIKE ?) "
+                                   : " AND folder = ? ";
         }
         if (!searchQuery.empty()) {
             sql += " AND (filename LIKE ? OR folder LIKE ? OR date_label LIKE ?) ";
@@ -300,8 +395,13 @@ public:
         }
 
         int bindIdx = 1;
+        std::string folderPrefix;
         if (!folderFilter.empty()) {
             sqlite3_bind_text(stmt, bindIdx++, folderFilter.c_str(), -1, SQLITE_STATIC);
+            if (folderRecursive) {
+                folderPrefix = folderFilter + "/%";
+                sqlite3_bind_text(stmt, bindIdx++, folderPrefix.c_str(), -1, SQLITE_STATIC);
+            }
         }
         std::string wildCard;
         if (!searchQuery.empty()) {
@@ -331,6 +431,13 @@ public:
             const unsigned char* dl = sqlite3_column_text(stmt, 14);
             rec.dateLabel = dl ? (const char*)dl : "";
             rec.starred = sqlite3_column_int(stmt, 15);
+
+            const void* blob = sqlite3_column_blob(stmt, 16);
+            if (blob && sqlite3_column_bytes(stmt, 16) == GalleryRecord::kPreviewBytes) {
+                memcpy(rec.preview, blob, GalleryRecord::kPreviewBytes);
+                rec.hasPreview = true;
+            }
+
             results.push_back(std::move(rec));
         }
 

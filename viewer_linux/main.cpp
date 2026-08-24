@@ -13,6 +13,7 @@ struct AppState {
     GLFWwindow* window = nullptr;
     int windowW = 1280;
     int windowH = 800;
+    bool redrawPending = true;   // drives poll-vs-wait in the main loop
     int fbW = 1280;
     int fbH = 800;
 
@@ -29,6 +30,10 @@ struct AppState {
     // View Transformation
     float scale = 1.0f;
     float targetScale = 1.0f;
+    float scaleVel = 0.0f;
+    float posVelX = 0.0f;
+    float posVelY = 0.0f;
+    float rotationVel = 0.0f;
     float fitScale = 1.0f;
 
     float posX = 0.0f;
@@ -157,15 +162,10 @@ static void panToMinimapNorm(float normX, float normY) {
 }
 
 static void applyLoadedImageMeta(const ImageMetadata& meta) {
-    int rot = 0;
-    if (meta.hasExif) {
-        int ori = meta.exifOrientation;
-        if (ori == 3) rot = 180;
-        else if (ori == 6) rot = 90;
-        else if (ori == 8) rot = 270;
-    }
-    g_app.targetRotation = (float)rot;
-    g_app.rotation = (float)rot;
+    // EXIF orientation is baked into the decoded pixels by the codec layer, so
+    // the view starts unrotated.
+    g_app.targetRotation = 0.0f;
+    g_app.rotation = 0.0f;
 
     fitToWindow(true);
 
@@ -200,7 +200,18 @@ static void loadCurrentFile() {
              g_app.currentImage.width, g_app.currentImage.height);
     glfwSetWindowTitle(g_app.window, titleBuf);
 
-    // 2. Check if full resolution buffer is already ready in RAM cache
+    // 2. Animated GIFs need every composited frame, which the single-frame
+    //    preloader cannot carry - decode them straight into the texture.
+    if (silvercodec::detectFormat(path) == silvercodec::FMT_GIF) {
+        if (g_app.currentImage.load(path)) {
+            g_app.currentImage.setFiltering(g_app.nearestFilter);
+            applyLoadedImageMeta(g_app.currentImage.meta);
+        }
+        g_app.ui.thumbs.preloadFolder(g_app.folder.fileList, g_app.folder.currentIndex);
+        return;
+    }
+
+    // 3. Check if full resolution buffer is already ready in RAM cache
     auto preloaded = g_app.preloader.getIfReady(path);
 
     if (preloaded && preloaded->data) {
@@ -213,7 +224,7 @@ static void loadCurrentFile() {
         g_app.preloader.requestPrimaryImage(path);
     }
 
-    // 3. Schedule multi-core background pre-loading for neighboring images
+    // 4. Schedule multi-core background pre-loading for neighboring images
     g_app.preloader.updatePreloadTargets(g_app.folder.fileList, g_app.folder.currentIndex);
     g_app.ui.thumbs.preloadFolder(g_app.folder.fileList, g_app.folder.currentIndex);
 }
@@ -238,10 +249,20 @@ static void toggleFullscreen() {
 // GLFW Callbacks & Touchpad Support
 // -----------------------------------------------------------------------------
 
+static void syncPixelScale() {
+    if (g_app.windowW <= 0) return;
+    float scale = (float)g_app.fbW / (float)g_app.windowW;
+    g_app.ui.font.setPixelScale(scale);
+    g_app.ui.iconAtlas.setPixelScale(scale);
+}
+
 static void framebufferSizeCallback(GLFWwindow* window, int w, int h) {
+    g_app.redrawPending = true;
     g_app.fbW = w;
     g_app.fbH = h;
     glViewport(0, 0, w, h);
+    g_app.ui.font.invalidateViewport();
+    syncPixelScale();
 }
 
 static void windowSizeCallback(GLFWwindow* window, int w, int h) {
@@ -253,6 +274,7 @@ static void windowSizeCallback(GLFWwindow* window, int w, int h) {
 }
 
 static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
+    g_app.redrawPending = true;
     g_app.mouseX = xpos;
     g_app.mouseY = ypos;
     g_app.ui.notifyUserActivity();
@@ -271,6 +293,7 @@ static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
 }
 
 static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
+    g_app.redrawPending = true;
     g_app.ui.notifyUserActivity();
     if (action == GLFW_PRESS) {
         double now = glfwGetTime();
@@ -385,6 +408,7 @@ static void mouseButtonCallback(GLFWwindow* window, int button, int action, int 
 }
 
 static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
+    g_app.redrawPending = true;
     g_app.ui.notifyUserActivity();
 
     // 1. Grid View Scrolling
@@ -433,6 +457,14 @@ static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
 }
 
 static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    g_app.redrawPending = true;
+    // Physical-position keys: a compositor remap (caps:swapescape) is invisible
+    // to GLFW, so honour the same config switch the gallery uses.
+    if (key == GLFW_KEY_CAPS_LOCK &&
+        SilverConfig::get().flag("keys.capsLockActsAsEscape", false)) {
+        key = GLFW_KEY_ESCAPE;
+    }
+
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
     g_app.ui.notifyUserActivity();
 
@@ -662,6 +694,13 @@ static void dropCallback(GLFWwindow* window, int count, const char** paths) {
 int main(int argc, char* argv[]) {
     std::cout << "Starting SilverViewer FilePilot (Linux / Wayland / Multi-Threaded Engine)...\n";
 
+    // Shared JSON config drives spacing, timings and animation switches.
+    SilverConfig::get().init(argv[0]);
+    silveranim::reloadFromConfig();
+    silvercodec::gifMaxFrames() = std::max(1, SilverConfig::get().integer("gif.maxFrames", 300));
+    silvercodec::gifMaxBytes()  = (size_t)std::max(8, SilverConfig::get().integer("gif.maxDecodeMegabytes", 256))
+                                  * 1024ull * 1024ull;
+
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW\n";
         return -1;
@@ -720,6 +759,7 @@ int main(int argc, char* argv[]) {
 
     glfwGetFramebufferSize(g_app.window, &g_app.fbW, &g_app.fbH);
     glfwGetWindowSize(g_app.window, &g_app.windowW, &g_app.windowH);
+    syncPixelScale();
 
     // Register Callbacks
     glfwSetFramebufferSizeCallback(g_app.window, framebufferSizeCallback);
@@ -736,6 +776,7 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
+    g_app.ui.thumbs.onWorkReady = []() { glfwPostEmptyEvent(); };
     if (!g_app.ui.init()) {
         std::cerr << "Failed to initialize FilePilot UI\n";
         return -1;
@@ -764,7 +805,21 @@ int main(int argc, char* argv[]) {
         lastTime = curTime;
 
         // Process Wayland desktop events
-        glfwPollEvents();
+        // Sleep between events unless something is actually changing: an image
+        // on screen with no animation needs no new frames.
+        bool busy = g_app.redrawPending ||
+                    g_app.currentImage.isAnimated() ||          // GIF playback
+                    g_app.preloader.isCurrentLoading.load() ||
+                    g_app.ui.thumbs.hasPendingWork() ||
+                    g_app.ui.animating ||
+                    std::abs(g_app.scale - g_app.targetScale) > 0.0005f ||
+                    std::abs(g_app.posX - g_app.targetPosX) > 0.05f ||
+                    std::abs(g_app.posY - g_app.targetPosY) > 0.05f ||
+                    std::abs(g_app.rotation - g_app.targetRotation) > 0.05f;
+
+        if (busy) glfwPollEvents();
+        else      glfwWaitEventsTimeout(0.2);
+        g_app.redrawPending = false;
 
         // Check if an asynchronously decoded large image became ready in background
         if (g_app.preloader.isCurrentLoading.load() && g_app.folder.hasFiles()) {
@@ -792,11 +847,15 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        float lerpFactor = 1.0f - expf(-24.0f * dt);
-        g_app.posX += (g_app.targetPosX - g_app.posX) * lerpFactor;
-        g_app.posY += (g_app.targetPosY - g_app.posY) * lerpFactor;
-        g_app.scale += (g_app.targetScale - g_app.scale) * lerpFactor;
-        g_app.rotation += (g_app.targetRotation - g_app.rotation) * lerpFactor;
+        // Animated GIF playback (no-op for stills).
+        g_app.currentImage.advanceAnimation(dt);
+
+        // Pan / zoom / rotation share one second-order channel.
+        const silveranim::Channel& tf = silveranim::rates().chViewerTransform;
+        silveranim::drivePos(g_app.posX, g_app.posVelX, g_app.targetPosX, tf, dt);
+        silveranim::drivePos(g_app.posY, g_app.posVelY, g_app.targetPosY, tf, dt);
+        silveranim::drive(g_app.scale, g_app.scaleVel, g_app.targetScale, tf, dt, 0.0005f);
+        silveranim::drivePos(g_app.rotation, g_app.rotationVel, g_app.targetRotation, tf, dt);
 
         bool isZoomedIn = (g_app.targetScale > g_app.fitScale * 1.05f);
         g_app.ui.update(dt, isZoomedIn, g_app.folder.count(), g_app.isFullscreen);
@@ -838,6 +897,8 @@ int main(int argc, char* argv[]) {
         }
 
         // 3. Render UI Overlays, Zoom Dropdown Menu, Minimap, and Badges
+        // One coalesced batch: every font.render() below only queues geometry.
+        g_app.ui.font.beginFrame(g_app.windowW, g_app.windowH);
         int curRotInt = ((int)(g_app.rotation + 0.5f) % 360 + 360) % 360;
         g_app.ui.render(
             g_app.windowW, g_app.windowH,
@@ -852,6 +913,7 @@ int main(int argc, char* argv[]) {
             g_app.preloader.isCurrentLoading.load(),
             g_app.currentImage.id
         );
+        g_app.ui.font.endFrame();
 
         glfwSwapBuffers(g_app.window);
     }

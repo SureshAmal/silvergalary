@@ -1,0 +1,243 @@
+{
+  "//": "SilverGallery configuration. Every value here is live-reloaded on save.",
+  "layout": {
+    "topBarHeight": 60,
+    "sidebarWidth": 290,
+    "sidebarInnerPadding": 16,
+    "contentTopOffset": 70,
+    "bottomPadding": 60,
+    "folderBannerHeight": 56,
+    "statusPillBottomMargin": 16,
+    "zoomPillBottomMargin": 18,
+    "zoomPillRightMargin": 20
+  },
+  "grid": {
+    "gap": 9,
+    "sidePadding": 12,
+    "sectionHeaderHeight": 46,
+    "sectionSpacing": 20,
+    "sectionBottomPadding": 16,
+    "tileRadius": 10,
+    "tileImagePadding": 2,
+    "tileMinSize": 40,
+    "minItemSize": 70,
+    "maxItemSize": 440,
+    "maxColumns": 24,
+    "hoverLift": 3.5,
+    "shadowOffset": 2,
+    "shadowAlpha": 0.2,
+    "shadowHoverAlpha": 0.16,
+    "selectedBorderWidth": 3,
+    "hoverBorderWidth": 2,
+    "captionHeight": 30,
+    "starBadgeSize": 26,
+    "starBadgeMargin": 6
+  },
+  "folders": {
+    "sidePadding": 24,
+    "gap": 16,
+    "cardWidth": 280,
+    "cardHeight": 80,
+    "cardRadius": 10,
+    "cardBorderWidth": 1,
+    "iconSize": 32
+  },
+  "sidebar": {
+    "previewHeight": 190,
+    "previewRadius": 8,
+    "buttonHeight": 34,
+    "buttonRadius": 6,
+    "metaRowHeight": 24,
+    "pathLineHeight": 20,
+    "pathMaxLines": 6,
+    "sectionSpacing": 14,
+    "borderWidth": 1
+  },
+  "fullscreen": {
+    "topBarHeight": 64,
+    "imageMargin": 40,
+    "arrowSize": 48,
+    "buttonSize": 36,
+    "minZoom": 0.2,
+    "maxZoom": 10,
+    "zoomStep": 0.15
+  },
+  "scrollbar": {
+    "width": 16,
+    "handleHeight": 30,
+    "topMargin": 40,
+    "bottomMargin": 80,
+    "radius": 4
+  },
+  "zoom": {
+    "wheelStep": 0.04,
+    "keyStep": 0.08,
+    "minScale": 0.05,
+    "maxScale": 1,
+    "popupWidth": 208,
+    "popupHeight": 214,
+    "popupRadius": 10,
+    "autoCloseSeconds": 3.5,
+    "presetXL": 1,
+    "presetLarge": 0.7,
+    "presetMedium": 0.45,
+    "presetSmall": 0.2,
+    "groupingThresholdDay": 0.3,
+    "groupingThresholdWeek": 0.2,
+    "groupingThresholdMonth": 0.12,
+    "groupingAnchorDay": 0.55,
+    "groupingAnchorWeek": 0.25,
+    "groupingAnchorMonth": 0.16,
+    "groupingAnchorYear": 0.08
+  },
+  "keys": {
+    "//": "GLFW reports physical key POSITIONS, so compositor-level remaps (XKB caps:swapescape, Hyprland kb_options) are invisible to this app. Enable this if your Caps Lock position sends Escape.",
+    "capsLockActsAsEscape": true,
+    "//escapeRepeat": "false = one Escape press dismisses one thing; true = holding Escape cascades",
+    "escapeRepeat": false
+  },
+  "icons": {
+    "//": "Lucide icon weight. 1.0 = upstream 2px stroke; raise for heavier icons.",
+    "strokeScale": 1.05
+  },
+  "text": {
+    "//": "Text rendering. hinting: light (GTK/Qt-style, crispest for UI) | normal | none | mono.",
+    "hinting": "light",
+    "forceAutohint": true,
+    "//pixelSize": "Interface text size in points; the whole UI scales with it.",
+    "pixelSize": 15
+  },
+  "gif": {
+    "//": "Animated GIF playback and decode caps.",
+    "animate": true,
+    "maxFrames": 300,
+    "maxDecodeMegabytes": 256
+  },
+  "animation": {
+    "//": "enabled:false makes every transition instant.",
+    "enabled": true,
+    "speedMultiplier": 0.600001,
+    "scrollRate": 20,
+    "scrollWheelStep": 64,
+    "layoutGlideRate": 26,
+    "hoverRate": 24,
+    "selectRate": 24,
+    "sidebarRate": 20,
+    "fullscreenRate": 20,
+    "zoomPopupRate": 24,
+    "themeMenuRate": 24,
+    "tabIndicatorRate": 24,
+    "filmstripRate": 15,
+    "skeletonPulseRate": 4,
+    "settleEpsilon": 0.2,
+    "fadeEpsilon": 0.005,
+    "animateOffscreenTiles": false,
+    "//layoutMargin": "How far beyond the viewport (points) tiles still animate during a reflow.",
+    "layoutMargin": 700,
+    "toastSeconds": 2,
+    "zoomPillSeconds": 2,
+    "//model": "spring = second-order physics, exponential = plain smoothing",
+    "model": "spring",
+    "//spring": "f = natural frequency (Hz), z = damping ratio (1.0 critically damped, <1 bouncy), r = initial response (>0 anticipates, <0 winds up)",
+    "spring": {
+      "tile": {
+        "frequency": 3,
+        "damping": 1,
+        "response": 0
+      },
+      "scroll": {
+        "frequency": 2.6,
+        "damping": 1.05,
+        "response": 0
+      },
+      "sidebar": {
+        "frequency": 2.4,
+        "damping": 0.9,
+        "response": 0.2
+      },
+      "fullscreen": {
+        "frequency": 3.2,
+        "damping": 0.95,
+        "response": 0.1
+      },
+      "hover": {
+        "frequency": 4,
+        "damping": 0.85,
+        "response": 0
+      },
+      "select": {
+        "frequency": 4,
+        "damping": 0.9,
+        "response": 0
+      },
+      "zoomPopup": {
+        "frequency": 3.6,
+        "damping": 0.85,
+        "response": 0.3
+      },
+      "themeMenu": {
+        "frequency": 3.6,
+        "damping": 0.85,
+        "response": 0.3
+      },
+      "tabIndicator": {
+        "frequency": 3.4,
+        "damping": 0.85,
+        "response": 0.2
+      },
+      "filmstrip": {
+        "frequency": 2.4,
+        "damping": 1,
+        "response": 0
+      },
+      "viewerTransform": {
+        "frequency": 3.4,
+        "damping": 1,
+        "response": 0
+      },
+      "viewerChrome": {
+        "frequency": 2.6,
+        "damping": 1,
+        "response": 0
+      },
+      "viewerPopup": {
+        "frequency": 3.6,
+        "damping": 0.85,
+        "response": 0.3
+      },
+      "viewerGridScroll": {
+        "frequency": 2.8,
+        "damping": 1.05,
+        "response": 0
+      }
+    }
+  },
+  "thumbnails": {
+    "//": "Tiers the grid decodes at; the smallest one covering the cell wins.",
+    "tiers": [96, 160, 256, 384, 512],
+    "tierHeadroom": 1.35,
+    "//masterTier": "One cached image per photo at this size; every smaller size is derived from it. 0 = largest tier.",
+    "masterTier": 0,
+    "//maxResidentMegabytes": "GPU memory budget for thumbnails. Counting textures instead of bytes meant this scaled with the zoom tier.",
+    "maxResidentMegabytes": 256,
+    "uploadsPerFrame": 32,
+    "diskCache": true,
+    "//useSharedCache": "read thumbnails already generated by the file manager (~/.cache/thumbnails)",
+    "useSharedCache": true,
+    "diskCacheQuality": 85,
+    "previewMaxEdge": 4096,
+    "prewarmLibrary": true,
+    "//prewarmWorkers": "0 = auto (worker count minus reservedWorkers)",
+    "prewarmWorkers": 0,
+    "reservedWorkers": 2,
+    "startupPrimeCount": 120,
+    "startupPrimeMillis": 900
+  },
+  "scanner": {
+    "batchSize": 450,
+    "walkerThreads": 0,
+    "inspectorThreads": 0,
+    "refreshIntervalSeconds": 1.7,
+    "pruneMissing": true
+  }
+}

@@ -5,6 +5,7 @@
 #include "theme.h"
 #include "image_loader.h"
 #include "thumbnails.h"
+#include "silver_anim.h"
 #include <string>
 #include <vector>
 #include <sstream>
@@ -95,6 +96,11 @@ public:
     float minimapAlpha = 0.0f;
 
     // Layout Constants
+    // Interface scale, driven by the configured text size exactly as in the
+    // gallery. Every chrome metric below is expressed at scale 1.0 and
+    // multiplied in applyScale().
+    float uiScale = 1.0f;
+
     float topBarH = 46.0f;
     float bottomStripH = 80.0f;
     float thumbW = 60.0f;
@@ -136,11 +142,29 @@ public:
     Rect zoomMenuRect;
     std::vector<Rect> zoomMenuItemRects;
 
-    bool init(const char* fontPath = "src/FiraSans-Regular.ttf") {
+    // No font path by default - the text engine resolves the system UI font
+    // through fontconfig. Passing one here only expresses a preference.
+    // Re-derive chrome metrics from the configured text size.
+    void applyScale() {
+        float k = silverUiScale(14.0f);   // the viewer's base text size
+        if (std::abs(k - uiScale) < 0.001f) return;
+
+        float rel = k / uiScale;
+        uiScale = k;
+
+        topBarH *= rel;
+        bottomStripH *= rel;
+        thumbW *= rel;
+        thumbH *= rel;
+        thumbGap *= rel;
+    }
+
+    bool init(const char* fontPath = nullptr) {
+        applyScale();
         theme.init();
         thumbs.init();
         iconAtlas.init();
-        return font.init(fontPath, 13.5f);
+        return font.init(fontPath, 14.0f);   // whole pixels: FreeType rounds anyway
     }
 
     void notifyUserActivity() {
@@ -158,7 +182,21 @@ public:
         notifyUserActivity();
     }
 
+    // Spring velocities for the viewer's animated chrome.
+    float scrollBarAlphaVel = 0.0f;
+    float uiVisibilityVel = 0.0f;
+    float metaPopupVel = 0.0f, metaPopupPrevTarget = 0.0f;
+    float zoomMenuVel = 0.0f, zoomMenuPrevTarget = 0.0f;
+    float themeMenuVel = 0.0f, themeMenuPrevTarget = 0.0f;
+    float minimapVel = 0.0f;
+    float gridScrollVel = 0.0f;
+
+    // Set at the end of update(): true while any chrome animation is still
+    // settling. The main loop uses it to decide whether to draw another frame.
+    bool animating = true;
+
     void update(float dt, bool isZoomedIn, int totalFiles, bool isFullscreen) {
+        const silveranim::Rates& anim = silveranim::rates();
         theme.update(dt);
         isFullscreenMode = isFullscreen;
 
@@ -166,12 +204,9 @@ public:
         shimmerPhase += dt * 3.0f;
 
         // Scrollbar Fade
-        if (scrollActivityTimer > 0.0f) {
-            scrollActivityTimer -= dt;
-            scrollBarAlpha += (1.0f - scrollBarAlpha) * (1.0f - expf(-16.0f * dt));
-        } else {
-            scrollBarAlpha += (0.0f - scrollBarAlpha) * (1.0f - expf(-8.0f * dt));
-        }
+        if (scrollActivityTimer > 0.0f) silveranim::tickTimer(scrollActivityTimer, dt);
+        silveranim::driveFade(scrollBarAlpha, scrollBarAlphaVel,
+                              scrollActivityTimer > 0.0f ? 1.0f : 0.0f, anim.chViewerChrome, dt);
 
         // Overall UI Visibility (auto-fade in fullscreen inactivity, completely 0 in presentation mode)
         float targetUIVisibility = 1.0f;
@@ -180,29 +215,27 @@ public:
         } else if (isFullscreen && !isGridView && metadataState == 0 && !showZoomMenu && inactivityTimer > 2.4f) {
             targetUIVisibility = 0.0f;
         }
-        uiVisibilityAlpha += (targetUIVisibility - uiVisibilityAlpha) * (1.0f - expf(-14.0f * dt));
+        silveranim::driveFade(uiVisibilityAlpha, uiVisibilityVel, targetUIVisibility, anim.chViewerChrome, dt);
 
-        if (toastTimer > 0.0f) {
-            toastTimer -= dt;
-            if (toastTimer <= 0.0f) toastMsg = "";
-        }
-        thumbs.updateGL();
+        silveranim::tickTimer(toastTimer, dt);
+        if (toastTimer == 0.0f && !toastMsg.empty()) toastMsg = "";
+        thumbs.updateGL(dt);
 
         // Smooth Metadata Popup Transition
         float targetAnim = (metadataState > 0 && !presentationMode) ? (float)metadataState : 0.0f;
-        metaPopupAnim += (targetAnim - metaPopupAnim) * (1.0f - expf(-20.0f * dt));
+        silveranim::driveTrackedFade(metaPopupAnim, metaPopupVel, metaPopupPrevTarget, targetAnim, anim.chViewerPopup, dt);
 
         // Smooth Zoom Menu Transition
         float targetZoomMenu = (showZoomMenu && !presentationMode) ? 1.0f : 0.0f;
-        zoomMenuAnim += (targetZoomMenu - zoomMenuAnim) * (1.0f - expf(-22.0f * dt));
+        silveranim::driveTrackedFade(zoomMenuAnim, zoomMenuVel, zoomMenuPrevTarget, targetZoomMenu, anim.chViewerPopup, dt);
 
         // Smooth Theme Menu Transition
         float targetThemeMenu = (showThemeMenu && !presentationMode) ? 1.0f : 0.0f;
-        themeMenuAnim += (targetThemeMenu - themeMenuAnim) * (1.0f - expf(-22.0f * dt));
+        silveranim::driveTrackedFade(themeMenuAnim, themeMenuVel, themeMenuPrevTarget, targetThemeMenu, anim.chViewerPopup, dt);
 
         // Smooth Minimap Fade
         float targetMinimap = (!presentationMode && !isGridView && isZoomedIn && uiVisibilityAlpha > 0.2f) ? 1.0f : 0.0f;
-        minimapAlpha += (targetMinimap - minimapAlpha) * (1.0f - expf(-16.0f * dt));
+        silveranim::driveFade(minimapAlpha, minimapVel, targetMinimap, anim.chViewerChrome, dt);
 
         // Clamp & Smooth Grid Scroll
         if (totalFiles > 0) {
@@ -214,11 +247,29 @@ public:
         } else {
             gridTargetScroll = 0.0f;
         }
-        gridScrollOffset += (gridTargetScroll - gridScrollOffset) * (1.0f - expf(-24.0f * dt));
+        silveranim::drivePos(gridScrollOffset, gridScrollVel, gridTargetScroll, anim.chViewerGridScroll, dt);
 
         // Clamp Filmstrip Scroll
         float maxFilmScroll = std::max(0.0f, totalFiles * (thumbW + thumbGap) - cachedWindowW + 32.0f);
         thumbs.targetScrollOffset = std::clamp(thumbs.targetScrollOffset, 0.0f, maxFilmScroll);
+
+        // Compare each animated value against the target it was just driven
+        // toward. Anything unsettled means the screen is still changing.
+        const float eps = 0.002f;
+        auto moving = [&](float value, float target) { return std::abs(value - target) > eps; };
+
+        animating =
+            moving(scrollBarAlpha, scrollActivityTimer > 0.0f ? 1.0f : 0.0f) ||
+            moving(uiVisibilityAlpha, targetUIVisibility) ||
+            moving(metaPopupAnim, targetAnim) ||
+            moving(zoomMenuAnim, targetZoomMenu) ||
+            moving(themeMenuAnim, targetThemeMenu) ||
+            moving(minimapAlpha, targetMinimap) ||
+            std::abs(gridScrollOffset - gridTargetScroll) > 0.05f ||
+            std::abs(thumbs.scrollOffset - thumbs.targetScrollOffset) > 0.05f ||
+            toastTimer > 0.0f ||
+            scrollActivityTimer > 0.0f ||
+            (isFullscreen && !presentationMode && inactivityTimer < 2.6f);
     }
 
     bool isInside(float mx, float my, float x, float y, float w, float h) {
@@ -226,12 +277,7 @@ public:
     }
 
     std::string truncateText(const std::string& str, float maxW) {
-        if (font.measureText(str) <= maxW) return str;
-        std::string res = str;
-        while (!res.empty() && font.measureText(res + "...") > maxW) {
-            res.pop_back();
-        }
-        return res + "...";
+        return font.fitWithEllipsis(str, maxW);
     }
 
     UIAction handleMouseDown(float mx, float my, int totalFiles, int currentIdx,
@@ -557,7 +603,7 @@ public:
                 size_t ls = fname.find_last_of("/\\");
                 if (ls != std::string::npos) fname = fname.substr(ls + 1);
 
-                std::string shortName = truncateText(fname, itemW - 14.0f);
+                std::string shortName = truncateText(fname, itemW - 14.0f * uiScale);
                 float tw = font.measureText(shortName);
                 float fx = tx + (itemW - tw) * 0.5f;
                 float fy = ty + itemH - 24.0f;
@@ -611,7 +657,7 @@ public:
             font.render(windowW, windowH);
 
             font.beginBatch();
-            font.addText(sx + 40.0f, sy + 8.5f, "Decoding Full Resolution...", pal.textPrimary);
+            font.addTextVCentered(sx + 40.0f * uiScale, sy, sh, "Decoding Full Resolution...", pal.textPrimary);
             font.render(windowW, windowH);
         }
 
@@ -629,7 +675,7 @@ public:
             font.addRect(0, topBarH - 1.0f, (float)windowW, 1.0f, topBorder);
 
             float btnW = 32.0f;
-            float btnH = 30.0f;
+            float btnH = std::max(26.0f * uiScale, font.textHeight() + 12.0f * uiScale);
             float btnY = (topBarH - btnH) * 0.5f;
             float curBtnX = 12.0f;
             float gap = 4.0f;
@@ -715,7 +761,7 @@ public:
             }
             if (!headerTrunc.empty()) {
                 Color4 headText = pal.textPrimary; headText.a *= uiAlpha;
-                font.addText(hbx + 10.0f, hby + 7.0f, headerTrunc, headText);
+                font.addTextVCentered(hbx + 10.0f * uiScale, hby, btnH, headerTrunc, headText);
             }
             Color4 cArr = pal.textSecondary; cArr.a *= uiAlpha;
             iconAtlas.drawIcon(font, (metadataState > 0) ? ICON_CHEVRON_DOWN : (headerTrunc.empty() ? ICON_INFO : ICON_CHEVRON_RIGHT),
@@ -782,7 +828,7 @@ public:
             // Render Header Text
             font.beginBatch();
             Color4 hCol = pal.textPrimary; hCol.a *= uiAlpha;
-            font.addText(hbx + 10.0f, hby + 5.0f, headerTrunc, hCol);
+            font.addTextVCentered(hbx + 10.0f * uiScale, hby, btnH, headerTrunc, hCol);
             font.render(windowW, windowH);
         }
 
@@ -925,7 +971,7 @@ public:
 
             font.beginBatch();
             Color4 zText = pal.textPrimary; zText.a *= uiAlpha;
-            font.addText(zx + 9.0f, zy + 6.0f, zoomStr, zText);
+            font.addTextVCentered(zx + 9.0f * uiScale, zy, zh, zoomStr, zText);
             font.render(windowW, windowH);
 
             // =========================================================
@@ -933,7 +979,7 @@ public:
             // =========================================================
             if (zoomMenuAnim > 0.01f) {
                 float menuW = 168.0f;
-                float rowH = 32.0f;
+                float rowH = std::max(28.0f * uiScale, font.textHeight() + 14.0f * uiScale);
                 float menuH = 6 * rowH + 16.0f;
 
                 float menuX = zx + zw - menuW;
@@ -978,10 +1024,10 @@ public:
                     Color4 tLabel = pal.textPrimary; tLabel.a *= zoomMenuAnim;
                     Color4 tShortcut = pal.textSecondary; tShortcut.a *= zoomMenuAnim;
 
-                    font.addText(menuX + 16.0f, curItemY + 8.0f, kZoomMenuItems[i].label, tLabel);
+                    font.addTextVCentered(menuX + 16.0f * uiScale, curItemY, rowH, kZoomMenuItems[i].label, tLabel);
                     if (kZoomMenuItems[i].shortcut && kZoomMenuItems[i].shortcut[0] != '\0') {
                         float sw = font.measureText(kZoomMenuItems[i].shortcut);
-                        font.addText(menuX + menuW - sw - 16.0f, curItemY + 8.0f, kZoomMenuItems[i].shortcut, tShortcut);
+                        font.addTextVCentered(menuX + menuW - sw - 16.0f * uiScale, curItemY, rowH, kZoomMenuItems[i].shortcut, tShortcut);
                     }
                     curItemY += rowH;
                 }
@@ -993,9 +1039,16 @@ public:
         // H. METADATA POPUP CARDS WITH FULL MULTI-LINE PATH SUPPORT
         // -------------------------------------------------------------
         if (metaPopupAnim > 0.01f) {
-            float cardW = 320.0f;
+            float cardW = 320.0f * uiScale;
 
-            float availValW = cardW - 125.0f;
+            // The value column starts after the widest label, so the wrap width
+            // used for measuring has to be derived the same way the drawing code
+            // derives it - otherwise the card is sized for a different layout
+            // than the one that gets painted.
+            float metaPad = 12.0f * uiScale;
+            float metaLabelColW = font.measureText("Perceived type") + 16.0f * uiScale;
+            float availValW = cardW - metaPad * 2.0f - metaLabelColW;
+
             int pathLines = 1;
             if (!meta.filePath.empty()) {
                 std::string testLine = "";
@@ -1022,7 +1075,7 @@ public:
                 if (meta.exif.ExposureTime > 0.0) expandedRowCount++;
             }
 
-            float rowH = 21.0f;
+            float rowH = font.lineHeight();
             float pathBlockH = std::max(1, pathLines) * 18.0f + 4.0f;
             float compactContentH = pathBlockH + 4 * rowH;
             float fullContentH = compactContentH + expandedRowCount * rowH;
@@ -1069,24 +1122,32 @@ public:
 
             // Text Rows
             font.beginBatch();
-            std::string pTitle = truncateText(meta.fileName.empty() ? "Properties" : meta.fileName, 210.0f);
-            font.addText(cardX + 12.0f, cardY + 8.0f, pTitle, pal.textPrimary);
+            // All of these were fixed pixel values that only lined up at the
+            // original font size. Derive them from the text metrics instead.
+            float pad = metaPad;
+            float lineH = font.lineHeight();
+            float labelColW = metaLabelColW;
 
-            float rowX = cardX + 12.0f;
-            float valX = cardX + 115.0f;
-            float rowY = cardY + 44.0f;
+            std::string pTitle = truncateText(meta.fileName.empty() ? "Properties" : meta.fileName,
+                                              popupCardRect.w - pad * 2.0f);
+            font.addText(cardX + pad, cardY + pad * 0.6f, pTitle, pal.textPrimary);
+
+            float rowX = cardX + pad;
+            float valX = cardX + pad + labelColW;
+            float rowY = cardY + pad * 0.6f + lineH * 1.6f;
+            float cardBottom = cardY + popupCardRect.h;
 
             // 1. Path (Multi-line full display)
-            if (rowY + 16.0f <= cardY + popupCardRect.h) {
+            if (rowY + lineH <= cardBottom) {
                 font.addText(rowX, rowY, "Path", pal.textPrimary);
-                int lines = font.addWrappedText(valX, rowY, meta.filePath, availValW, 18.0f, pal.textSecondary);
-                rowY += std::max(1, lines) * 18.0f + 4.0f;
+                int lines = font.addWrappedText(valX, rowY, meta.filePath, availValW, lineH, pal.textSecondary);
+                rowY += std::max(1, lines) * lineH + 4.0f * uiScale;
             }
 
             auto drawRow = [&](const std::string& label, const std::string& val) {
-                if (rowY + 16.0f > cardY + popupCardRect.h) return;
+                if (rowY + lineH > cardBottom) return;
                 font.addText(rowX, rowY, label, pal.textPrimary);
-                std::string tVal = truncateText(val, popupCardRect.w - (valX - cardX) - 12.0f);
+                std::string tVal = truncateText(val, popupCardRect.w - (valX - cardX) - pad);
                 font.addText(valX, rowY, tVal, pal.textSecondary);
                 rowY += rowH;
             };
@@ -1156,7 +1217,7 @@ public:
             font.render(windowW, windowH);
 
             font.beginBatch();
-            font.addText(tx + 18.0f, ty + 8.5f, toastMsg, pal.textAccent);
+            font.addTextVCentered(tx + 18.0f * uiScale, ty, th, toastMsg, pal.textAccent);
             font.render(windowW, windowH);
         }
 
@@ -1260,7 +1321,7 @@ public:
 
                 Color4 textCol = isActive ? Color4(1, 1, 1, tmAlpha) : pal.textPrimary;
                 font.beginBatch();
-                font.addText(optX + 32.0f, optY + 7.5f, to.label, textCol);
+                font.addTextVCentered(optX + 32.0f * uiScale, optY, optH, to.label, textCol);
                 font.render(windowW, windowH);
 
                 optY += optH + 3.0f;

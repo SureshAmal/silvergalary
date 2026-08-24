@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cctype>
+#include "silver_codec.h"
 
 namespace fs = std::filesystem;
 
@@ -16,13 +17,7 @@ public:
     int currentIndex = -1;
 
     static bool isSupportedImageExtension(const std::string& ext) {
-        std::string lower = ext;
-        for (char& c : lower) c = tolower(c);
-        return lower == ".png"  || lower == ".jpg"  || lower == ".jpeg" ||
-               lower == ".bmp"  || lower == ".tga"  || lower == ".gif"  ||
-               lower == ".psd"  || lower == ".hdr"  || lower == ".pic"  ||
-               lower == ".pnm"  || lower == ".ppm"  || lower == ".pgm"  ||
-               lower == ".webp" || lower == ".ico";
+        return silvercodec::isSupportedExtension(ext);
     }
 
     static bool naturalSortComparator(const std::string& a, const std::string& b) {
@@ -66,6 +61,17 @@ public:
                         currentIndex = (int)i;
                         break;
                     }
+                }
+            }
+
+            // A requested file that is not in the listing must still be shown.
+            // Falling through to index 0 meant asking for one photo and being
+            // given a different one, with no indication anything had happened.
+            if (currentIndex == -1 && !targetFile.empty()) {
+                fileList.push_back(targetFile);
+                std::sort(fileList.begin(), fileList.end(), naturalSortComparator);
+                for (size_t i = 0; i < fileList.size(); ++i) {
+                    if (fileList[i] == targetFile) { currentIndex = (int)i; break; }
                 }
             }
 

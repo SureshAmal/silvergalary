@@ -2,8 +2,9 @@
 
 #include "gl_loader.h"
 #include <easyexif/exif.h>
-#define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+#include "silver_codec.h"
+#include "silver_platform.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -58,6 +59,49 @@ public:
     ImageMetadata meta;
     bool isLoaded = false;
 
+    // Animated GIF playback state (empty for every other format).
+    silvercodec::GifAnimation gif;
+    int gifFrame = 0;
+    float gifClock = 0.0f;
+    bool gifPlaying = true;
+
+    bool isAnimated() const { return gif.frameCount > 1; }
+    int frameCount() const { return gif.frameCount; }
+
+    // Advance GIF playback and push the current frame to the GPU.
+    // Returns true when a new frame was uploaded.
+    bool advanceAnimation(float dt) {
+        if (!isAnimated() || !gifPlaying || !id) return false;
+
+        int delay = gif.delaysMs[(size_t)gifFrame];
+        gifClock += dt * 1000.0f;
+        if (gifClock < (float)delay) return false;
+
+        int guard = 0;
+        while (gifClock >= (float)delay && guard++ < gif.frameCount) {
+            gifClock -= (float)delay;
+            gifFrame = (gifFrame + 1) % gif.frameCount;
+            delay = gif.delaysMs[(size_t)gifFrame];
+        }
+
+        const unsigned char* frame = gif.frame(gifFrame);
+        if (!frame) return false;
+
+        glBindTexture(GL_TEXTURE_2D, id);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gif.width, gif.height,
+                        GL_RGBA, GL_UNSIGNED_BYTE, frame);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        return true;
+    }
+
+    void resetAnimation() {
+        gif = silvercodec::GifAnimation();
+        gifFrame = 0;
+        gifClock = 0.0f;
+        gifPlaying = true;
+    }
+
     ~ImageTexture() {
         unload();
     }
@@ -68,13 +112,14 @@ public:
             id = 0;
         }
         if (rawData) {
-            stbi_image_free(rawData);
+            silvercodec::freePixels(rawData);
             rawData = nullptr;
         }
         isLoaded = false;
         width = 0;
         height = 0;
         channels = 0;
+        resetAnimation();
     }
 
     static std::string formatBytes(size_t bytes) {
@@ -128,7 +173,10 @@ public:
         }
 
         int w = 0, h = 0, comp = 0;
-        if (stbi_info(path.c_str(), &w, &h, &comp)) {
+        if (silvercodec::info(path, &w, &h, &comp)) {
+            // Rotated shots report their pre-rotation size in the header.
+            meta.exifOrientation = silvercodec::readExifOrientation(path);
+            if (meta.exifOrientation >= 5) std::swap(w, h);
             width = w;
             height = h;
             channels = comp;
@@ -141,7 +189,7 @@ public:
     }
 
     bool uploadPixels(const unsigned char* pixels, int w, int h, const ImageMetadata& metadata) {
-        unload();
+        unload();   // also clears any previous animation
         if (!pixels || w <= 0 || h <= 0) return false;
 
         meta = metadata;
@@ -203,10 +251,7 @@ public:
         struct passwd* pw = getpwuid(st.st_uid);
         meta.ownerStr = pw ? pw->pw_name : "user";
 
-        char hostBuf[128] = "linux";
-        if (gethostname(hostBuf, sizeof(hostBuf)) == 0) {
-            meta.computerStr = hostBuf;
-        }
+        meta.computerStr = silverplat::hostName();
 
         size_t lastSlash = path.find_last_of("/\\");
         if (lastSlash != std::string::npos) {
@@ -239,6 +284,12 @@ public:
         } else if (ext == "gif") {
             meta.fileTypeStr = "GIF Image";
             meta.mimeType = "image/gif";
+        } else if (ext == "svg" || ext == "svgz") {
+            meta.fileTypeStr = "SVG Vector";
+            meta.mimeType = "image/svg+xml";
+        } else if (ext == "avif") {
+            meta.fileTypeStr = "AVIF Image";
+            meta.mimeType = "image/avif";
         } else {
             meta.fileTypeStr = "Image File";
             meta.mimeType = "image/" + ext;
@@ -268,10 +319,26 @@ public:
             }
         }
 
-        int origComp = 0;
-        rawData = stbi_load(path.c_str(), &width, &height, &origComp, 4);
+        int origComp = 4;
+        if (silvercodec::detectFormat(path) == silvercodec::FMT_GIF &&
+            silvercodec::loadGifAnimation(path, gif) && gif.valid()) {
+            // Keep every composited frame so the viewer can play it back.
+            width = gif.width;
+            height = gif.height;
+            origComp = 4;
+            size_t bytes = gif.frameBytes();
+            rawData = (unsigned char*)malloc(bytes);
+            if (rawData) memcpy(rawData, gif.frame(0), bytes);
+            gifFrame = 0;
+            gifClock = 0.0f;
+        } else {
+            rawData = silvercodec::loadRGBA(path, &width, &height, &origComp);
+        }
         if (!rawData) {
             return false;
+        }
+        if (meta.exifOrientation > 1 && !isAnimated()) {
+            rawData = silvercodec::applyOrientation(rawData, width, height, meta.exifOrientation, &width, &height);
         }
         channels = 4;
         meta.width = width;
@@ -280,6 +347,10 @@ public:
         meta.bitDepth = origComp * 8;
         meta.megapixels = (float)(width * height) / 1000000.0f;
         meta.dimensionsStr = std::to_string(width) + " x " + std::to_string(height);
+        if (isAnimated()) {
+            meta.fileTypeStr = "GIF Animation";
+            meta.dimensionsStr += "  (" + std::to_string(gif.frameCount) + " frames)";
+        }
 
         int g = gcd(width, height);
         if (g > 0) {

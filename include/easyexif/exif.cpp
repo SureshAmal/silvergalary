@@ -402,10 +402,13 @@ void parseIFEntryHeader(const unsigned char *buf, bool alignIntel,
 IFEntry parseIFEntry(const unsigned char *buf, const unsigned offs,
                      const bool alignIntel, const unsigned base,
                      const unsigned len) {
+  // Returning a prvalue directly lets the compiler elide the copy entirely.
+  // std::move here actually prevented that (-Wpessimizing-move) - it forced a
+  // move construction where there would otherwise have been no construction.
   if (alignIntel) {
-    return std::move(parseIFEntry_temp<true>(buf, offs, base, len));
+    return parseIFEntry_temp<true>(buf, offs, base, len);
   } else {
-    return std::move(parseIFEntry_temp<false>(buf, offs, base, len));
+    return parseIFEntry_temp<false>(buf, offs, base, len);
   }
 }
 }

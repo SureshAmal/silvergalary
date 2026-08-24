@@ -1,12 +1,19 @@
-all: viewer gallery
+all: thirdparty viewer gallery
 
-viewer:
+# Built once and shared by both binaries. Made an explicit target so a parallel
+# `make -j` cannot have both sub-makes racing to produce the same object file.
+thirdparty:
+	@$(MAKE) -C gallery_linux ../lib/thirdparty.o
+	@$(MAKE) -C gallery_linux ../lib/exif.o
+
+viewer: thirdparty
 	@$(MAKE) -C viewer_linux
 
-gallery:
+gallery: thirdparty
 	@$(MAKE) -C gallery_linux
 
 clean:
+	@rm -f lib/thirdparty.o lib/exif.o
 	@$(MAKE) -C viewer_linux clean
 	@$(MAKE) -C gallery_linux clean
 
@@ -16,4 +23,4 @@ run: viewer
 run_gallery: gallery
 	@$(MAKE) -C gallery_linux run
 
-.PHONY: all viewer gallery clean run run_gallery
+.PHONY: all thirdparty viewer gallery clean run run_gallery

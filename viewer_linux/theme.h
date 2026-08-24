@@ -71,11 +71,19 @@ public:
                 fseek(fp, 0, SEEK_END);
                 long sz = ftell(fp);
                 fseek(fp, 0, SEEK_SET);
+
+                std::string s;
                 if (sz > 0 && sz < 2 * 1024 * 1024) {
                     std::vector<char> buf(sz + 1, 0);
                     size_t readBytes = fread(buf.data(), 1, sz, fp);
-                    fclose(fp);
-                    std::string s(buf.data(), readBytes);
+                    s.assign(buf.data(), readBytes);
+                }
+                // Close on every path. The old code only closed inside the size
+                // check, so an empty or oversized dconf file leaked a descriptor
+                // every time the theme was re-detected - which happens on a poll.
+                fclose(fp);
+
+                if (!s.empty()) {
 
                     // 1. Check GNOME color-scheme ('prefer-dark' vs 'prefer-light' / 'default')
                     size_t pos = s.find("color-scheme");
@@ -92,8 +100,6 @@ public:
                         if (gtkSub.find("dark") != std::string::npos || gtkSub.find("Dark") != std::string::npos) return true;
                         if (gtkSub.find("light") != std::string::npos || gtkSub.find("Light") != std::string::npos) return false;
                     }
-                } else {
-                    fclose(fp);
                 }
             }
         }

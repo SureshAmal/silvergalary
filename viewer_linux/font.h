@@ -7,8 +7,15 @@
 #include <cmath>
 #include <algorithm>
 
-#define STB_TRUETYPE_IMPLEMENTATION
+// Declarations only - src/silver_thirdparty.cpp compiles the implementations.
+// stb_rect_pack must still precede stb_truetype here, because stb_truetype
+// declares its own stbrp_* types unless STB_RECT_PACK_VERSION is already set.
+#include <stb_rect_pack.h>
 #include <stb_truetype.h>
+
+// FreeType + HarfBuzz text stack. Falls back to the stb_truetype ASCII bake
+// when the libraries are not present at build time.
+#include "silver_text.h"
 
 struct UIVertex {
     float x, y;
@@ -20,6 +27,9 @@ struct UIVertex {
 class FontRenderer {
 public:
     GLuint fontTexture = 0;
+    GLuint emojiTexture = 0;      // RGBA page for colour glyphs
+    int emojiGeneration = -1;
+    int emojiDimUploaded = 0;
     stbtt_bakedchar cdata[96]; // ASCII 32..126
     int texWidth = 512;
     int texHeight = 512;
@@ -31,11 +41,124 @@ public:
     GLint uFontTextureLoc = -1;
     GLint uCustomTextureLoc = -1;
     GLint uIconTextureLoc = -1;
+    GLint uEmojiTextureLoc = -1;
 
     std::vector<UIVertex> vertices;
 
+#ifdef HAVE_HARFBUZZ
+    silvertext::TextEngine text;
+    int atlasGeneration = -1;
+    int atlasDimUploaded = 0;
+    bool useShaping = false;
+#endif
+
+    // Framebuffer pixels per layout point. On a 1.25x scaled display the
+    // framebuffer is larger than the window, so glyphs and icons must be
+    // rasterized at physical resolution and only *positioned* in points -
+    // otherwise the GPU upscales a low-resolution atlas and everything looks
+    // soft and pixelated.
+    GLint cachedViewport[4] = { 0, 0, 1, 1 };
+    bool viewportValid = false;
+
+    // Called on resize; the next frame re-queries.
+    void invalidateViewport() { viewportValid = false; }
+
+    float pixelScale = 1.0f;
+    float requestedSize = 15.0f;   // in points, before scaling
+
+    void setPixelScale(float scale) {
+        if (scale < 0.5f) scale = 1.0f;
+        if (std::abs(scale - pixelScale) < 0.01f) return;
+        pixelScale = scale;
+        viewportValid = false;
+        applyTextConfig();
+    }
+
+    // Re-read text settings (size, hinting) and rebuild the atlas if needed.
+    void applyTextConfig() {
+#ifdef HAVE_HARFBUZZ
+        if (!useShaping) return;
+        float configured = SilverConfig::get().num("text.pixelSize", 0.0f);
+        float pts = (configured > 0.0f) ? configured : requestedSize;
+        if (text.reconfigure(pts * pixelScale)) {
+            fontSize = pts;
+            atlasGeneration = -1;   // force a full re-upload
+        }
+#endif
+    }
+
+    // -------------------------------------------------------------------------
+    // Frame batching
+    //
+    // Call sites push geometry into `vertices` and then call render(), which used
+    // to mean one glBufferData + one glDrawArrays each time - several hundred per
+    // frame once the photo grid is full. With a frame open, render() instead
+    // appends into a single per-frame vertex buffer and records a draw command;
+    // adjacent commands that need no conflicting texture are merged, so the whole
+    // frame collapses to one upload and roughly one draw per distinct thumbnail.
+    // Order is never rearranged, so the painter's-algorithm result is identical.
+    // -------------------------------------------------------------------------
+    struct DrawCmd {
+        GLuint customTex = 0;
+        GLuint iconTex = 0;
+        size_t first = 0;
+        size_t count = 0;
+        bool clip = false;                     // scissor this command
+        float cx = 0, cy = 0, cw = 0, ch = 0;  // clip rect, UI coordinates
+    };
+
+    // Current clip, inherited by commands queued while it is set. Commands with
+    // different clip state never merge, so a scrolling list can be masked to its
+    // viewport even though every draw is deferred to endFrame().
+    bool clipActive = false;
+    float clipX = 0, clipY = 0, clipW = 0, clipH = 0;
+
+    void pushClip(float x, float y, float w, float h) {
+        clipActive = true;
+        clipX = x; clipY = y; clipW = w; clipH = h;
+    }
+
+    void popClip() { clipActive = false; }
+
+    ~FontRenderer() {
+        if (fontTexture) glDeleteTextures(1, &fontTexture);
+        if (emojiTexture) glDeleteTextures(1, &emojiTexture);
+        if (vbo) glDeleteBuffers(1, &vbo);
+        if (vao) glDeleteVertexArrays(1, &vao);
+        if (shaderProgram) glDeleteProgram(shaderProgram);
+    }
+
+    std::vector<UIVertex> frameVertices;
+    std::vector<DrawCmd> frameCmds;
+    bool frameActive = false;
+    int frameW = 0;
+    int frameH = 0;
+
+    // Diagnostics for the last completed frame.
+    int drawCallsLastFrame = 0;
+    int batchesLastFrame = 0;
+    size_t verticesLastFrame = 0;
+
     bool init(const char* fontPath = nullptr, float size = 15.0f) {
         fontSize = size;
+        requestedSize = size;
+
+#ifdef HAVE_HARFBUZZ
+        {
+            std::vector<std::string> explicitFonts;
+            if (fontPath && fontPath[0] != '\0') explicitFonts.push_back(fontPath);
+            // Rasterize in framebuffer pixels; layout still happens in points.
+            useShaping = text.init(fontSize * pixelScale, explicitFonts);
+            if (useShaping) {
+                // FreeType owns the glyph atlas; the stb bake below is skipped.
+                glGenTextures(1, &fontTexture);
+                syncFontAtlas();
+                return initShaderAndBuffers();
+            }
+            fprintf(stderr, "[SilverText] shaping unavailable, using stb_truetype\n");
+        }
+#endif
+
         FILE* f = (fontPath && fontPath[0] != '\0') ? fopen(fontPath, "rb") : nullptr;
         if (!f) {
             const char* fallbacks[] = {
@@ -106,6 +229,10 @@ public:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
+        return initShaderAndBuffers();
+    }
+
+    bool initShaderAndBuffers() {
         // UI Shader supporting solid color, font alpha, custom textures, and vector icon atlas
         const char* vsSource = R"(
             #version 330 core
@@ -125,30 +252,44 @@ public:
             }
         )";
 
-        const char* fsSource = R"(
-            #version 330 core
+        const char* fsBody = R"(
             in vec2 vUV;
             in vec4 vCol;
             in float vUseTex;
             uniform sampler2D uFontTexture;
             uniform sampler2D uCustomTexture;
             uniform sampler2D uIconTexture;
+            uniform sampler2D uEmojiTexture;
             out vec4 FragColor;
             void main() {
-                if (vUseTex > 2.5) { // Icon Atlas Alpha
+                if (vUseTex > 3.5) { // Colour glyph: keep the glyph's own colour
+                    vec4 tex = texture(uEmojiTexture, vUV);
+                    FragColor = vec4(tex.rgb, tex.a * vCol.a);
+                } else if (vUseTex > 2.5) { // Icon Atlas Alpha
                     float alpha = texture(uIconTexture, vUV).a;
                     FragColor = vec4(vCol.rgb, vCol.a * alpha);
                 } else if (vUseTex > 1.5) { // Custom Texture (Thumbnail)
                     vec4 tex = texture(uCustomTexture, vUV);
                     FragColor = vec4(tex.rgb, tex.a * vCol.a);
-                } else if (vUseTex > 0.5) { // Font Alpha
-                    float alpha = texture(uFontTexture, vUV).a;
+                } else if (vUseTex > 0.5) { // Font coverage
+                    float alpha = texture(uFontTexture, vUV).FONT_CHANNEL;
                     FragColor = vec4(vCol.rgb, vCol.a * alpha);
                 } else { // Solid Color
                     FragColor = vCol;
                 }
             }
         )";
+
+        // The FreeType atlas is single channel (GL_R8); the legacy stb bake is
+        // RGBA with coverage in alpha.
+        std::string fsFull = std::string("#version 330 core\n");
+#ifdef HAVE_HARFBUZZ
+        fsFull += useShaping ? "#define FONT_CHANNEL r\n" : "#define FONT_CHANNEL a\n";
+#else
+        fsFull += "#define FONT_CHANNEL a\n";
+#endif
+        fsFull += fsBody;
+        const char* fsSource = fsFull.c_str();
 
         GLuint vs = glCreateShader(GL_VERTEX_SHADER);
         glShaderSource(vs, 1, &vsSource, nullptr);
@@ -170,6 +311,7 @@ public:
         uFontTextureLoc = glGetUniformLocation(shaderProgram, "uFontTexture");
         uCustomTextureLoc = glGetUniformLocation(shaderProgram, "uCustomTexture");
         uIconTextureLoc = glGetUniformLocation(shaderProgram, "uIconTexture");
+        uEmojiTextureLoc = glGetUniformLocation(shaderProgram, "uEmojiTexture");
 
         glGenVertexArrays(1, &vao);
         glGenBuffers(1, &vbo);
@@ -191,6 +333,129 @@ public:
 
         glBindVertexArray(0);
         return true;
+    }
+
+#ifdef HAVE_HARFBUZZ
+    // Push the FreeType glyph atlas to the GPU whenever new glyphs appeared.
+    void syncFontAtlas() {
+        if (!useShaping || !text.dirty) return;
+
+        int dim = text.atlasSize();
+        glBindTexture(GL_TEXTURE_2D, fontTexture);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+        if (dim != atlasDimUploaded || text.generation != atlasGeneration) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, dim, dim, 0,
+                         GL_RED, GL_UNSIGNED_BYTE, text.atlasPixels().data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            atlasDimUploaded = dim;
+            atlasGeneration = text.generation;
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, dim, dim,
+                            GL_RED, GL_UNSIGNED_BYTE, text.atlasPixels().data());
+        }
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+        text.dirty = false;
+    }
+
+    // The colour page is created lazily, only once an emoji is actually shaped.
+    void syncEmojiAtlas() {
+        if (!useShaping || !text.hasColorGlyphs() || !text.colorDirty) return;
+
+        if (!emojiTexture) glGenTextures(1, &emojiTexture);
+
+        int dim = text.colorAtlasSize();
+        glBindTexture(GL_TEXTURE_2D, emojiTexture);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+        if (dim != emojiDimUploaded || text.colorGeneration != emojiGeneration) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, dim, dim, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, text.colorAtlasPixels().data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            emojiDimUploaded = dim;
+            emojiGeneration = text.colorGeneration;
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, dim, dim,
+                            GL_RGBA, GL_UNSIGNED_BYTE, text.colorAtlasPixels().data());
+        }
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+        text.colorDirty = false;
+    }
+
+    float lineHeight() const {
+        return useShaping ? (text.lineHeightPx() / pixelScale) : fontSize * 1.35f;
+    }
+    // Height of the inked line box (no line gap) - the right value for
+    // vertically centering a label inside a button or chip.
+    float textHeight() const {
+        return useShaping ? ((text.ascentPx() + text.descentPx()) / pixelScale) : fontSize;
+    }
+#else
+    void syncFontAtlas() {}
+    void syncEmojiAtlas() {}
+    float lineHeight() const { return fontSize * 1.35f; }
+    float textHeight() const { return fontSize; }
+#endif
+
+    // Center a label in a box using real font metrics instead of a hand-tuned
+    // vertical offset. Never starts left of the box, so a label that is wider
+    // than its box overflows to the right only.
+    void addTextCenteredIn(float x, float y, float w, float h, const std::string& str, Color4 col) {
+        float tw = measureText(str);
+        float tx = x + (w - tw) * 0.5f;
+        if (tx < x) tx = x;
+        float ty = y + (h - textHeight()) * 0.5f;
+        addText(std::round(tx), std::round(ty), str, col);
+    }
+
+    // Vertical centering only, caller owns x.
+    void addTextVCentered(float x, float y, float h, const std::string& str, Color4 col) {
+        addText(x, std::round(y + (h - textHeight()) * 0.5f), str, col);
+    }
+
+    // Soft shadow cast from a vertical edge.
+    //
+    // A single constant-alpha rectangle is not a shadow - it reads as a painted
+    // grey stripe, which is obvious on a light theme. Real falloff needs a
+    // gradient, so this lays down thin slices with quadratic decay.
+    void addVerticalEdgeShadow(float edgeX, float y, float h, float width,
+                               float alpha, bool towardLeft, int steps = 8) {
+        if (width <= 0.0f || h <= 0.0f || alpha <= 0.0f) return;
+        if (steps < 1) steps = 1;
+
+        float sliceW = width / (float)steps;
+        for (int i = 0; i < steps; ++i) {
+            // t: 0 at the edge, 1 at the far end of the falloff.
+            float t = ((float)i + 0.5f) / (float)steps;
+            float a = alpha * (1.0f - t) * (1.0f - t);
+            float x = towardLeft ? (edgeX - (float)(i + 1) * sliceW)
+                                 : (edgeX + (float)i * sliceW);
+            addRect(x, y, sliceW + 0.5f, h, Color4(0.0f, 0.0f, 0.0f, a));
+        }
+    }
+
+    // Same idea for a horizontal edge (a bar casting a shadow onto content).
+    void addHorizontalEdgeShadow(float edgeY, float x, float w, float height,
+                                 float alpha, bool towardUp, int steps = 6) {
+        if (height <= 0.0f || w <= 0.0f || alpha <= 0.0f) return;
+        if (steps < 1) steps = 1;
+
+        float sliceH = height / (float)steps;
+        for (int i = 0; i < steps; ++i) {
+            float t = ((float)i + 0.5f) / (float)steps;
+            float a = alpha * (1.0f - t) * (1.0f - t);
+            float y = towardUp ? (edgeY - (float)(i + 1) * sliceH)
+                               : (edgeY + (float)i * sliceH);
+            addRect(x, y, w, sliceH + 0.5f, Color4(0.0f, 0.0f, 0.0f, a));
+        }
     }
 
     void beginBatch() {
@@ -373,8 +638,50 @@ public:
         return output;
     }
 
-    void addText(float x, float y, const std::string& text, Color4 col) {
-        std::string cleanText = sanitizeUTF8(text);
+    void addText(float x, float y, const std::string& str, Color4 col) {
+#ifdef HAVE_HARFBUZZ
+        if (useShaping) {
+            // `y` stays the top of the line, matching the old stb behaviour, so
+            // every existing layout constant still lines up.
+            const silvertext::ShapedRun& run = text.shape(str);
+
+            // Glyph metrics are in framebuffer pixels. Position each quad on a
+            // whole *physical* pixel, then convert back to points - snapping in
+            // point space would still land between texels on a scaled display.
+            const float inv = 1.0f / pixelScale;
+            float penPx = x * pixelScale;
+            float baselinePx = y * pixelScale + text.ascentPx();
+
+            for (const silvertext::PositionedGlyph& pg : run.glyphs) {
+                const silvertext::Glyph* g = text.glyphAt(pg.glyphIndex);
+                if (!g || g->width <= 0 || g->height <= 0) continue;
+
+                float px0 = std::round(penPx + pg.x + (float)g->bearingX);
+                float py0 = std::round(baselinePx - pg.y - (float)g->bearingY);
+
+                float x0 = px0 * inv;
+                float y0 = py0 * inv;
+                float x1 = (px0 + (float)g->width) * inv;
+                float y1 = (py0 + (float)g->height) * inv;
+
+                // Colour glyphs sample the RGBA page and ignore the text colour.
+                float mode = g->color ? 4.0f : 1.0f;
+
+                UIVertex v[6] = {
+                    { x0, y0, g->u0, g->v0, col.r, col.g, col.b, col.a, mode },
+                    { x1, y0, g->u1, g->v0, col.r, col.g, col.b, col.a, mode },
+                    { x1, y1, g->u1, g->v1, col.r, col.g, col.b, col.a, mode },
+
+                    { x0, y0, g->u0, g->v0, col.r, col.g, col.b, col.a, mode },
+                    { x1, y1, g->u1, g->v1, col.r, col.g, col.b, col.a, mode },
+                    { x0, y1, g->u0, g->v1, col.r, col.g, col.b, col.a, mode },
+                };
+                vertices.insert(vertices.end(), v, v + 6);
+            }
+            return;
+        }
+#endif
+        std::string cleanText = sanitizeUTF8(str);
         float curX = x;
         float curY = y + fontSize * 0.85f;
 
@@ -396,30 +703,90 @@ public:
         }
     }
 
-    int addWrappedText(float x, float y, const std::string& text, float maxW, float lineH, Color4 col) {
-        if (text.empty()) return 0;
+    // Truncate to fit `maxW`, appending an ellipsis.
+    //
+    // Lives here so the gallery and the viewer share one implementation - they
+    // previously had separate copies, one of which cut in the middle of a UTF-8
+    // sequence and produced a broken glyph.
+    // Longest prefix of `str` (cut on a character boundary) such that
+    // prefix + suffix fits in maxW. Returns a byte count.
+    size_t longestPrefixThatFits(const std::string& str, float maxW, const std::string& suffix) {
+        // Candidate cut points are character starts, never byte offsets: cutting
+        // mid-sequence yields a broken glyph, and snapping a byte midpoint back
+        // to a boundary can fail to make progress and loop forever.
+        std::vector<size_t> cuts;
+        cuts.reserve(str.size() + 1);
+        cuts.push_back(0);
+        for (size_t i = 1; i < str.size(); ++i) {
+            if (((unsigned char)str[i] & 0xC0) != 0x80) cuts.push_back(i);
+        }
+        cuts.push_back(str.size());
+
+        size_t lo = 0, hi = cuts.size() - 1;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo + 1) / 2;   // strictly greater than lo, so this ends
+            if (measureText(str.substr(0, cuts[mid]) + suffix) <= maxW) lo = mid;
+            else hi = mid - 1;
+        }
+        return cuts[lo];
+    }
+
+    std::string fitWithEllipsis(const std::string& str, float maxW) {
+        if (str.empty() || measureText(str) <= maxW) return str;
+
+        const std::string ell = "...";
+        size_t keep = longestPrefixThatFits(str, maxW, ell);
+        if (keep == 0) return ell;
+        return str.substr(0, keep) + ell;
+    }
+
+    // Length in bytes of the UTF-8 sequence starting at `i`.
+    static size_t utf8SequenceLength(const std::string& s, size_t i) {
+        if (i >= s.size()) return 0;
+        unsigned char c = (unsigned char)s[i];
+        size_t len = 1;
+        if ((c & 0xF8) == 0xF0) len = 4;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        if (i + len > s.size()) len = 1;
+        return len;
+    }
+
+    int addWrappedText(float x, float y, const std::string& str, float maxW, float lineH, Color4 col) {
+        if (str.empty()) return 0;
         std::string line = "";
         float curY = y;
         int lineCount = 0;
-        std::string cleanText = sanitizeUTF8(text);
 
-        for (size_t i = 0; i < cleanText.size(); ++i) {
-            char c = cleanText[i];
-            if (c == '\n') {
+#ifdef HAVE_HARFBUZZ
+        const std::string& source = useShaping ? str : (sanitizeCache = sanitizeUTF8(str));
+#else
+        const std::string& source = (sanitizeCache = sanitizeUTF8(str));
+#endif
+
+        // Advance one whole character at a time, never one byte, so multi-byte
+        // sequences are never split mid-glyph.
+        size_t i = 0;
+        while (i < source.size()) {
+            size_t len = utf8SequenceLength(source, i);
+            std::string ch = source.substr(i, len);
+            i += len;
+
+            if (ch == "\n") {
                 addText(x, curY, line, col);
-                line = "";
+                line.clear();
                 curY += lineH;
                 lineCount++;
                 continue;
             }
-            std::string test = line + c;
-            if (measureText(test) > maxW && !line.empty()) {
+
+            if (measureText(line + ch) > maxW && !line.empty()) {
                 addText(x, curY, line, col);
-                line = std::string(1, c);
+                line = ch;
                 curY += lineH;
                 lineCount++;
             } else {
-                line += c;
+                line += ch;
             }
         }
         if (!line.empty()) {
@@ -429,8 +796,13 @@ public:
         return lineCount;
     }
 
-    float measureText(const std::string& text) {
-        std::string cleanText = sanitizeUTF8(text);
+    std::string sanitizeCache;   // backing store for the fallback wrap path
+
+    float measureText(const std::string& str) {
+#ifdef HAVE_HARFBUZZ
+        if (useShaping) return text.measure(str) / pixelScale;
+#endif
+        std::string cleanText = sanitizeUTF8(str);
         float x = 0.0f;
         for (char c : cleanText) {
             if (c < 32 || c > 126) {
@@ -442,9 +814,173 @@ public:
         return x;
     }
 
+    // Open a frame. Everything rendered until endFrame() is coalesced.
+    void beginFrame(int windowWidth, int windowHeight) {
+        frameActive = true;
+        frameW = windowWidth;
+        frameH = windowHeight;
+        frameVertices.clear();
+        frameCmds.clear();
+        batchesLastFrame = 0;
+        clipActive = false;
+    }
+
+    // Can this command be folded into the previous one? Only textures the shader
+    // will actually sample matter: a batch that binds nothing is compatible with
+    // anything, and a batch that already owns a texture accepts more geometry
+    // needing that same texture.
+    static bool texCompatible(GLuint existing, GLuint wanted) {
+        return existing == 0 || wanted == 0 || existing == wanted;
+    }
+
+    void appendToFrame(GLuint customTex, GLuint iconTex) {
+        if (vertices.empty()) return;
+
+        size_t first = frameVertices.size();
+        frameVertices.insert(frameVertices.end(), vertices.begin(), vertices.end());
+        batchesLastFrame++;
+
+        if (!frameCmds.empty()) {
+            DrawCmd& last = frameCmds.back();
+            bool sameClip = (last.clip == clipActive) &&
+                            (!clipActive || (last.cx == clipX && last.cy == clipY &&
+                                             last.cw == clipW && last.ch == clipH));
+            if (sameClip && texCompatible(last.customTex, customTex) &&
+                texCompatible(last.iconTex, iconTex)) {
+                if (customTex) last.customTex = customTex;
+                if (iconTex) last.iconTex = iconTex;
+                last.count += vertices.size();
+                return;
+            }
+        }
+
+        DrawCmd cmd;
+        cmd.customTex = customTex;
+        cmd.iconTex = iconTex;
+        cmd.first = first;
+        cmd.count = vertices.size();
+        cmd.clip = clipActive;
+        cmd.cx = clipX; cmd.cy = clipY; cmd.cw = clipW; cmd.ch = clipH;
+        frameCmds.push_back(cmd);
+    }
+
+    // Upload the whole frame once and issue the merged draw commands.
+    void endFrame() {
+        if (!frameActive) return;
+        frameActive = false;
+
+        drawCallsLastFrame = 0;
+        verticesLastFrame = frameVertices.size();
+        if (frameVertices.empty() || frameCmds.empty()) return;
+
+        // Any glyph shaped during this frame must reach the GPU before we draw.
+        syncFontAtlas();
+        syncEmojiAtlas();
+
+        glUseProgram(shaderProgram);
+        setProjection(frameW, frameH);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, fontTexture);
+        glUniform1i(uFontTextureLoc, 0);
+        glUniform1i(uCustomTextureLoc, 1);
+        glUniform1i(uIconTextureLoc, 2);
+        glUniform1i(uEmojiTextureLoc, 3);
+        if (emojiTexture) {
+            glActiveTexture(GL_TEXTURE3);
+            glBindTexture(GL_TEXTURE_2D, emojiTexture);
+        }
+
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+
+        // Orphan the old storage so the driver never stalls waiting on the
+        // previous frame's draws, then fill it in one shot.
+        glBufferData(GL_ARRAY_BUFFER, frameVertices.size() * sizeof(UIVertex), nullptr, GL_STREAM_DRAW);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, frameVertices.size() * sizeof(UIVertex), frameVertices.data());
+
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_DEPTH_TEST);
+
+        // Scissor works in framebuffer pixels from the bottom-left, while the UI
+        // is laid out in window points from the top-left, so the real viewport
+        // is needed to convert. Cached: glGetIntegerv is a driver round-trip and
+        // the viewport only changes on resize.
+        GLint* vp = cachedViewport;
+        if (!viewportValid) {
+            glGetIntegerv(GL_VIEWPORT, cachedViewport);
+            viewportValid = true;
+        }
+        float sx = (frameW > 0) ? (float)vp[2] / (float)frameW : 1.0f;
+        float sy = (frameH > 0) ? (float)vp[3] / (float)frameH : 1.0f;
+
+        GLuint boundCustom = 0;
+        GLuint boundIcon = 0;
+        bool scissorOn = false;
+        for (const DrawCmd& cmd : frameCmds) {
+            if (cmd.clip) {
+                if (!scissorOn) { glEnable(GL_SCISSOR_TEST); scissorOn = true; }
+                GLint rx = vp[0] + (GLint)std::floor(cmd.cx * sx);
+                GLint rw = (GLint)std::ceil(cmd.cw * sx);
+                GLint rh = (GLint)std::ceil(cmd.ch * sy);
+                GLint ry = vp[1] + vp[3] - (GLint)std::ceil((cmd.cy + cmd.ch) * sy);
+                glScissor(rx, ry, std::max(0, rw), std::max(0, rh));
+            } else if (scissorOn) {
+                glDisable(GL_SCISSOR_TEST);
+                scissorOn = false;
+            }
+            if (cmd.customTex && cmd.customTex != boundCustom) {
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, cmd.customTex);
+                boundCustom = cmd.customTex;
+            }
+            if (cmd.iconTex && cmd.iconTex != boundIcon) {
+                glActiveTexture(GL_TEXTURE2);
+                glBindTexture(GL_TEXTURE_2D, cmd.iconTex);
+                boundIcon = cmd.iconTex;
+            }
+            glDrawArrays(GL_TRIANGLES, (GLint)cmd.first, (GLsizei)cmd.count);
+            drawCallsLastFrame++;
+        }
+        if (scissorOn) glDisable(GL_SCISSOR_TEST);
+
+        glBindVertexArray(0);
+        glUseProgram(0);
+        frameVertices.clear();
+        frameCmds.clear();
+    }
+
+    void setProjection(int windowWidth, int windowHeight) {
+        float L = 0.0f, R = (float)windowWidth;
+        float T = 0.0f, B = (float)windowHeight;
+        float N = -1.0f, F = 1.0f;
+
+        float proj[16] = {
+            2.0f / (R - L), 0.0f,           0.0f,          0.0f,
+            0.0f,           2.0f / (T - B), 0.0f,          0.0f,
+            0.0f,           0.0f,          -2.0f / (F - N), 0.0f,
+            -(R + L)/(R-L), -(T + B)/(T-B), -(F + N)/(F-N), 1.0f
+        };
+        glUniformMatrix4fv(uProjectionLoc, 1, GL_FALSE, proj);
+    }
+
     void render(int windowWidth, int windowHeight, GLuint customTex = 0, GLuint iconTex = 0) {
         if (vertices.empty()) return;
 
+        // Inside a frame this only queues work; the GPU is touched once, in
+        // endFrame().
+        if (frameActive) {
+            // Deliberately does not clear `vertices` - see below.
+            // Deliberately does not clear `vertices` - the immediate path never
+            // did either, so any call site that renders twice without an
+            // intervening beginBatch() keeps producing identical output.
+            appendToFrame(customTex, iconTex);
+            return;
+        }
+
+        syncFontAtlas();
+        syncEmojiAtlas();
         glUseProgram(shaderProgram);
 
         float L = 0.0f, R = (float)windowWidth;

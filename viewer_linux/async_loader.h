@@ -2,6 +2,8 @@
 
 #include "gl_loader.h"
 #include "image_loader.h"
+#include "silver_codec.h"
+#include "silver_platform.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -46,6 +48,10 @@ public:
 
     std::string currentLoadingPath = "";
     std::atomic<bool> isCurrentLoading{false};
+
+    // Cap for decoded preview resolution (0 = decode at native size). Keeps a
+    // 100 MP photo from turning into a 400 MB RGBA buffer for a preview pane.
+    int maxDecodeEdge = 0;
 
     void init() {
         // Utilize 4-6 background workers dedicated to pre-loading and large image decoding
@@ -207,10 +213,7 @@ public:
                 struct passwd* pw = getpwuid(st.st_uid);
                 meta.ownerStr = pw ? pw->pw_name : "user";
 
-                char hostBuf[128] = "linux";
-                if (gethostname(hostBuf, sizeof(hostBuf)) == 0) {
-                    meta.computerStr = hostBuf;
-                }
+                meta.computerStr = silverplat::hostName();
 
                 size_t lastSlash = path.find_last_of("/\\");
                 if (lastSlash != std::string::npos) {
@@ -265,8 +268,17 @@ public:
                     }
                 }
 
-                int w = 0, h = 0, origComp = 0;
-                unsigned char* raw = stbi_load(path.c_str(), &w, &h, &origComp, 4);
+                int w = 0, h = 0, origComp = 4;
+                unsigned char* raw = nullptr;
+                if (maxDecodeEdge > 0) {
+                    int ow = 0, oh = 0;
+                    raw = silvercodec::loadThumbRGBA(path, maxDecodeEdge, &w, &h, &ow, &oh);
+                } else {
+                    raw = silvercodec::loadRGBA(path, &w, &h, &origComp);
+                }
+                if (raw && meta.exifOrientation > 1) {
+                    raw = silvercodec::applyOrientation(raw, w, h, meta.exifOrientation, &w, &h);
+                }
                 if (raw) {
                     meta.width = w;
                     meta.height = h;
@@ -292,7 +304,7 @@ public:
                         it->second->ready = true;
                         it->second->inProgress = false;
                     } else {
-                        stbi_image_free(raw);
+                        silvercodec::freePixels(raw);
                     }
                 }
             }

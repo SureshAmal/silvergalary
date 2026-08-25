@@ -634,30 +634,19 @@ public:
         }
 
         // =============================================================
-        // B. LOADING SHIMMER / SKELETON INDICATOR (for 60+ MP images)
+        // B. QUIET FIRST-LOAD INDICATOR
         // =============================================================
-        if (isImageDecoding && !isGridView) {
+        // Navigation normally has a thumbnail ready, so never cover it with a
+        // decoding banner. Only a truly blank first load gets a small,
+        // text-free activity mark.
+        if (isImageDecoding && !isGridView && currentTextureId == 0) {
             font.beginBatch();
-            float sw = 220.0f;
-            float sh = 36.0f;
-            float sx = ((float)windowW - sw) * 0.5f;
-            float sy = topBarH + 20.0f;
-
-            Color4 sBg = pal.cardBg;
-            sBg.a = 0.94f;
-            font.addRoundedRect(sx + 3, sy + 3, sw, sh, 18.0f, Color4(0, 0, 0, 0.35f));
-            font.addRoundedRect(sx, sy, sw, sh, 18.0f, sBg);
-            font.addRoundedBorder(sx, sy, sw, sh, 18.0f, 1.0f, pal.cardBorder);
-
             float pulse = 0.5f + 0.5f * sinf(shimmerPhase);
             Color4 pulseCol = pal.accent;
-            pulseCol.a = 0.4f + 0.5f * pulse;
-            font.addRoundedRect(sx + 14.0f, sy + 16.0f, 16.0f, 4.0f, 2.0f, pulseCol);
-
-            font.render(windowW, windowH);
-
-            font.beginBatch();
-            font.addTextVCentered(sx + 40.0f * uiScale, sy, sh, "Decoding Full Resolution...", pal.textPrimary);
+            pulseCol.a = 0.35f + 0.55f * pulse;
+            float dot = 8.0f * uiScale;
+            font.addRoundedRect(((float)windowW - dot) * 0.5f, topBarH + 18.0f,
+                                dot, dot, dot * 0.5f, pulseCol);
             font.render(windowW, windowH);
         }
 

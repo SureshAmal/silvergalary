@@ -643,18 +643,12 @@ public:
             if (sec.startY > bandBottom) break;
 
             for (auto& itm : sec.items) {
-                // Off-screen rows were snapped at layout time, so anything we
-                // animate here is genuinely on screen.
-                silveranim::driveRect(itm.animX, itm.animY, itm.animW, itm.animH, itm.motionVel,
-                                      itm.x, itm.y, itm.w, itm.h, anim.chLayout, dt);
-
-                float curTop = itm.animY;
-                float curLeft = itm.animX;
-                float curBottom = curTop + itm.animH;
-                float curRight = curLeft + itm.animW;
-
+                const bool wasVisible = itm.isVisible;
                 bool wasInBand = itm.inAnimBand;
-                itm.inAnimBand = (curBottom >= bandTop && curTop <= bandBottom);
+                bool targetInBand = (itm.y + itm.h >= bandTop && itm.y <= bandBottom);
+                bool targetVisible = (itm.y + itm.h >= viewTop - 60.0f &&
+                                      itm.y <= viewBottom + 60.0f);
+                itm.inAnimBand = targetInBand;
 
                 if (!wasInBand && itm.inAnimBand) {
                     // Just entered the band from far away - start it at its slot
@@ -664,13 +658,41 @@ public:
                     itm.animW = itm.w;
                     itm.animH = itm.h;
                     itm.motionVel.clear();
-                    curTop = itm.y;
-                    curLeft = itm.x;
-                    curBottom = curTop + itm.h;
-                    curRight = curLeft + itm.w;
                 }
 
-                if (curBottom >= viewTop - 60.0f && curTop <= viewBottom + 60.0f) {
+                // If zooming moved a destination into view while its animated
+                // position is still outside the viewport, showing that stale
+                // trajectory makes the photo fly down from the top. Entering
+                // tiles start at their real slot; tiles already on screen keep
+                // their ordinary smooth reflow.
+                bool animOutsideView = (itm.animY + itm.animH < viewTop - 60.0f ||
+                                        itm.animY > viewBottom + 60.0f);
+                float travelX = std::abs(itm.animX - itm.x);
+                float travelY = std::abs(itm.animY - itm.y);
+                bool travelsTooFar = std::max(travelX, travelY) > anim.maxVisibleLayoutTravel;
+                // A large travel is suspicious only for a tile newly entering
+                // the viewport. Tiles that were already visible must keep their
+                // shared reflow animation, otherwise a zoom makes half the grid
+                // glide while the other half snaps. The outside-view check
+                // still prevents genuinely stale positions flying in from the
+                // top or bottom.
+                if (targetVisible && (animOutsideView || (travelsTooFar && !wasVisible))) {
+                    silveranim::snapRect(itm.animX, itm.animY, itm.animW, itm.animH,
+                                         itm.x, itm.y, itm.w, itm.h);
+                    itm.motionVel.clear();
+                }
+
+                if (itm.inAnimBand) {
+                    silveranim::driveRect(itm.animX, itm.animY, itm.animW, itm.animH, itm.motionVel,
+                                          itm.x, itm.y, itm.w, itm.h, anim.chLayout, dt);
+                }
+
+                float curTop = itm.animY;
+                float curLeft = itm.animX;
+                float curBottom = curTop + itm.animH;
+                float curRight = curLeft + itm.animW;
+
+                if (targetVisible) {
                     itm.isVisible = true;
                     itm.isHovered = (mouseX >= curLeft && mouseX <= curRight &&
                                      mouseY >= curTop - scrollY && mouseY <= curBottom - scrollY &&

@@ -7,6 +7,7 @@
 #include "silver_config.h"
 #include "silver_xdgthumb.h"
 #include "silver_anim.h"
+#include "silver_constants.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -90,6 +91,7 @@ public:
     int diskCacheQuality = 85;
     std::vector<int> tiers = { 96, 160, 256, 384, 512 };
     float tierHeadroom = 1.35f;
+    float pixelScale = 1.0f;
 
     // One cached image per photo, at the largest tier. Every smaller size is
     // derived from it in memory (~2 ms) rather than decoded from the original
@@ -127,6 +129,10 @@ public:
                                             : (tiers.empty() ? 512 : tiers.back());
         if (!c.flag("thumbnails.diskCache", true)) diskCacheEnabled = false;
         useSharedCache = c.flag("thumbnails.useSharedCache", true);
+    }
+
+    void setPixelScale(float scale) {
+        pixelScale = (scale >= silver::defaults::minPixelScale) ? scale : 1.0f;
     }
 
     float scrollOffset = 0.0f;
@@ -405,8 +411,8 @@ public:
     // Snap to one of the configured tiers so zooming reuses decoded textures
     // instead of re-decoding the library on every pinch step.
     int quantizeEdge(float cellPixels) const {
-        if (tiers.empty()) return 512;
-        float need = cellPixels * tierHeadroom; // headroom for HiDPI and hover lift
+        if (tiers.empty()) return silver::defaults::thumbnailEdge;
+        float need = cellPixels * pixelScale * tierHeadroom;
         for (int t : tiers) {
             if (need <= (float)t) return t;
         }

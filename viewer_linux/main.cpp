@@ -4,6 +4,7 @@
 #include "folder.h"
 #include "ui.h"
 #include "async_loader.h"
+#include "silver_constants.h"
 #include <GLFW/glfw3.h>
 #include <iostream>
 #include <algorithm>
@@ -11,11 +12,11 @@
 
 struct AppState {
     GLFWwindow* window = nullptr;
-    int windowW = 1280;
-    int windowH = 800;
+    int windowW = silver::defaults::viewerWindowWidth;
+    int windowH = silver::defaults::viewerWindowHeight;
     bool redrawPending = true;   // drives poll-vs-wait in the main loop
-    int fbW = 1280;
-    int fbH = 800;
+    int fbW = silver::defaults::viewerWindowWidth;
+    int fbH = silver::defaults::viewerWindowHeight;
 
     int savedWinX = 100, savedWinY = 100;
     int savedWinW = 1280, savedWinH = 800;
@@ -189,8 +190,15 @@ static void loadCurrentFile() {
     // 1. Fast Header Probe: Instant image dimensions, layout & fitting in microseconds!
     // This guarantees window resizing, zooming, and smooth interaction work immediately
     // even while the high-resolution pixel buffer is decoding in the background!
+    // Release the old GPU texture before probeHeader replaces its path and
+    // dimensions.  The thumbnail below gives us an immediate progressive
+    // preview without ever presenting stale pixels as the new image.
+    if (g_app.currentImage.meta.filePath != path) g_app.currentImage.unload();
     g_app.currentImage.probeHeader(path);
-    fitToWindow();
+    // A new image is a content swap, not a zoom gesture.  Snap the viewport to
+    // its new fit geometry so different aspect ratios do not animate through a
+    // distracting scale-up/scale-down pulse while paging quickly.
+    fitToWindow(true);
 
     // Update window title immediately
     char titleBuf[512];
@@ -250,10 +258,23 @@ static void toggleFullscreen() {
 // -----------------------------------------------------------------------------
 
 static void syncPixelScale() {
-    if (g_app.windowW <= 0) return;
-    float scale = (float)g_app.fbW / (float)g_app.windowW;
+    if (g_app.windowW <= 0 || g_app.windowH <= 0) return;
+    float scaleX = (float)g_app.fbW / (float)g_app.windowW;
+    float scaleY = (float)g_app.fbH / (float)g_app.windowH;
+    float scale = std::max(scaleX, scaleY);
     g_app.ui.font.setPixelScale(scale);
     g_app.ui.iconAtlas.setPixelScale(scale);
+    g_app.ui.thumbs.setPixelScale(scale);
+}
+
+static void contentScaleCallback(GLFWwindow* window, float, float) {
+    glfwGetWindowSize(window, &g_app.windowW, &g_app.windowH);
+    glfwGetFramebufferSize(window, &g_app.fbW, &g_app.fbH);
+    glViewport(0, 0, g_app.fbW, g_app.fbH);
+    g_app.ui.font.invalidateViewport();
+    syncPixelScale();
+    fitToWindow(true);
+    g_app.redrawPending = true;
 }
 
 static void framebufferSizeCallback(GLFWwindow* window, int w, int h) {
@@ -709,7 +730,9 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_SAMPLES, 4);
+    int msaaSamples = std::clamp(SilverConfig::get().integer("display.msaaSamples", silver::defaults::msaaSamples),
+                                 0, silver::limits::maxMsaaSamples);
+    glfwWindowHint(GLFW_SAMPLES, msaaSamples);
 
     // Set Application ID & Class Context for Wayland & X11 (Prevents 'unknown' and ANR issues)
 #ifdef GLFW_WAYLAND_APP_ID
@@ -764,6 +787,7 @@ int main(int argc, char* argv[]) {
     // Register Callbacks
     glfwSetFramebufferSizeCallback(g_app.window, framebufferSizeCallback);
     glfwSetWindowSizeCallback(g_app.window, windowSizeCallback);
+    glfwSetWindowContentScaleCallback(g_app.window, contentScaleCallback);
     glfwSetCursorPosCallback(g_app.window, cursorPosCallback);
     glfwSetMouseButtonCallback(g_app.window, mouseButtonCallback);
     glfwSetScrollCallback(g_app.window, scrollCallback);
@@ -781,6 +805,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to initialize FilePilot UI\n";
         return -1;
     }
+    if (msaaSamples > 0) glEnable(GL_MULTISAMPLE);
 
     g_app.preloader.init();
 
@@ -869,29 +894,40 @@ int main(int argc, char* argv[]) {
         g_app.imageShader.drawBackground(g_app.windowW, g_app.windowH, activeBgMode, g_app.ui.theme.isDarkMode);
 
         // 2. Render Single Image (Full Res or Progressive Preview)
+        GLuint visibleTextureId = 0;
         if (!g_app.ui.isGridView) {
-            GLuint renderTexId = g_app.currentImage.id;
+            // probeHeader() updates dimensions before the async upload.  Do not
+            // stretch the previous image texture into those new dimensions.
+            bool currentTextureMatches = g_app.currentImage.id &&
+                g_app.currentImage.meta.filePath == g_app.folder.currentPath();
+            visibleTextureId = currentTextureMatches ? g_app.currentImage.id : 0;
 
             // If full resolution is still decoding in background, fall back to thumbnail texture
-            if (!renderTexId && g_app.folder.hasFiles()) {
+            if (!visibleTextureId && g_app.folder.hasFiles()) {
                 auto it = g_app.ui.thumbs.cache.find(g_app.folder.currentPath());
                 if (it != g_app.ui.thumbs.cache.end() && it->second.ready) {
-                    renderTexId = it->second.texId;
+                    visibleTextureId = it->second.texId;
                 }
             }
 
-            if (renderTexId) {
+            if (visibleTextureId) {
                 int curRotInt = ((int)(g_app.rotation + 0.5f) % 360 + 360) % 360;
                 float drawW = (float)(g_app.currentImage.width > 0 ? g_app.currentImage.width : 800);
                 float drawH = (float)(g_app.currentImage.height > 0 ? g_app.currentImage.height : 600);
 
+                // Align the image centre to the physical framebuffer grid.
+                // Sampling remains fractional for zoom, but a stable 1:1 view
+                // no longer softens because the whole quad sits half a pixel
+                // between samples.
+                float drawX = g_app.ui.font.snapToPixel(g_app.posX);
+                float drawY = g_app.ui.font.snapToPixel(g_app.posY);
                 g_app.imageShader.draw(
                     g_app.windowW, g_app.windowH,
-                    g_app.posX, g_app.posY,
+                    drawX, drawY,
                     drawW, drawH,
                     g_app.scale, curRotInt,
                     activeBgMode, g_app.pixelGrid,
-                    renderTexId
+                    visibleTextureId
                 );
             }
         }
@@ -911,7 +947,7 @@ int main(int argc, char* argv[]) {
             curRotInt,
             g_app.nearestFilter, g_app.pixelGrid,
             g_app.preloader.isCurrentLoading.load(),
-            g_app.currentImage.id
+            visibleTextureId
         );
         g_app.ui.font.endFrame();
 

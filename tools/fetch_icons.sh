@@ -15,6 +15,8 @@ ICON_FIT:maximize:0
 ICON_1TO1:ratio:0
 ICON_ROTATE:rotate-cw:0
 ICON_GRID:grid-3x3:0
+ICON_GRID_2X2:grid-2x2:0
+ICON_GRID_4X4:grid-4x4:0
 ICON_GRID_CHECK:square-check:0
 ICON_TARGET:target:0
 ICON_INFO:info:0

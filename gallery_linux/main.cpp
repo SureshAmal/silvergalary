@@ -24,6 +24,7 @@
 #include "../viewer_linux/icons.h"
 #include "silver_config.h"
 #include "silver_anim.h"
+#include "silver_constants.h"
 #include "db.h"
 #include "scanner.h"
 #include "timeline.h"
@@ -31,10 +32,10 @@
 
 struct GalleryApp {
     GLFWwindow* window = nullptr;
-    int windowW = 1200;
-    int windowH = 800;
-    int fbW = 1200;
-    int fbH = 800;
+    int windowW = silver::defaults::galleryWindowWidth;
+    int windowH = silver::defaults::galleryWindowHeight;
+    int fbW = silver::defaults::galleryWindowWidth;
+    int fbH = silver::defaults::galleryWindowHeight;
 
     double mouseX = 0;
     double mouseY = 0;
@@ -108,15 +109,42 @@ static void selectFlatIndex(int index) {
     if (index < 0 || index >= (int)g_gal.timeline.flatAllItems.size()) return;
 
     const GalleryRecord rec = g_gal.timeline.flatAllItems[index]->record;
+    const bool sidebarWasOpen = g_gal.ui.showSidebar && !g_gal.ui.selectedPath.empty();
     g_gal.ui.selectPhoto(rec, g_gal.timeline);
 
-    float gridW = g_gal.ui.gridWidth((float)g_gal.windowW);
-    bool hasBanner = (!g_gal.ui.activeFolderFilter.empty() && g_gal.ui.currentTab != TAB_FOLDERS);
-    g_gal.ui.relayoutKeepingAnchor(g_gal.timeline, gridW, hasBanner, (float)g_gal.windowH, rec.path);
+    // Opening the inspector changes the available grid width once. Moving the
+    // keyboard selection while it is already open does not, so rebuilding the
+    // full timeline on every arrow press only creates competing motion.
+    if (!sidebarWasOpen) {
+        float gridW = g_gal.ui.gridWidth((float)g_gal.windowW);
+        bool hasBanner = (!g_gal.ui.activeFolderFilter.empty() && g_gal.ui.currentTab != TAB_FOLDERS);
+        g_gal.ui.relayoutKeepingAnchor(g_gal.timeline, gridW, hasBanner,
+                                       (float)g_gal.windowH, rec.path);
+    }
 
     if (const TimelineItem* itm = g_gal.timeline.findItem(rec.path)) {
         g_gal.ui.ensureItemVisible(itm->y, itm->h, g_gal.timeline.totalContentHeight,
                                    (float)g_gal.windowH);
+    }
+}
+
+// Return from the lightbox to the exact photo the user reached there. Keeping
+// this in one path makes Escape, Back, and the close button restore identical
+// gallery context.
+static void closeFullscreenAndRevealSelection() {
+    GalleryUI& ui = g_gal.ui;
+    ui.isFullScreenView = false;
+    ui.showThemeMenu = false;
+    ui.showZoomPopup = false;
+    ui.fsZoom = 1.0f;
+    ui.fsPanX = 0.0f;
+    ui.fsPanY = 0.0f;
+    ui.isFsDragging = false;
+
+    g_gal.timeline.selectItem(ui.selectedPath);
+    if (const TimelineItem* item = g_gal.timeline.findItem(ui.selectedPath)) {
+        ui.ensureItemVisible(item->y, item->h, g_gal.timeline.totalContentHeight,
+                             (float)g_gal.windowH);
     }
 }
 
@@ -151,10 +179,24 @@ static void copyPathToClipboard(const std::string& path) {
 // window, and rasterizing at window size then letting the GPU upscale is what
 // makes text and icons look pixelated.
 static void syncPixelScale() {
-    if (g_gal.windowW <= 0) return;
-    float scale = (float)g_gal.fbW / (float)g_gal.windowW;
+    if (g_gal.windowW <= 0 || g_gal.windowH <= 0) return;
+    float scaleX = (float)g_gal.fbW / (float)g_gal.windowW;
+    float scaleY = (float)g_gal.fbH / (float)g_gal.windowH;
+    // Rasterize for the denser axis. GLFW normally reports equal axes, but
+    // max() remains sharp under unusual compositor transforms as well.
+    float scale = std::max(scaleX, scaleY);
     g_gal.font.setPixelScale(scale);
     g_gal.iconAtlas.setPixelScale(scale);
+    g_gal.ui.thumbs.setPixelScale(scale);
+}
+
+static void contentScaleCallback(GLFWwindow* window, float, float) {
+    glfwGetWindowSize(window, &g_gal.windowW, &g_gal.windowH);
+    glfwGetFramebufferSize(window, &g_gal.fbW, &g_gal.fbH);
+    glViewport(0, 0, g_gal.fbW, g_gal.fbH);
+    g_gal.font.invalidateViewport();
+    syncPixelScale();
+    g_gal.redrawPending = true;
 }
 
 static void framebufferSizeCallback(GLFWwindow* window, int w, int h) {
@@ -213,11 +255,45 @@ static void mouseButtonCallback(GLFWwindow* window, int button, int action, int 
                                                    (float)g_gal.windowH, act.targetPath);
                     break;
                 }
+                case GalleryUIAction::CLOSE_FULLSCREEN:
+                    closeFullscreenAndRevealSelection();
+                    break;
                 case GalleryUIAction::OPEN_IN_VIEWER:
                     launchViewer(act.targetPath);
                     break;
                 case GalleryUIAction::TOGGLE_STAR:
-                    g_gal.db.toggleStarred(act.targetPath);
+                    if (g_gal.db.toggleStarred(act.targetPath)) {
+                        // The database, record vector, grid item and inspector
+                        // are separate copies. Keep all of them authoritative
+                        // immediately so reselecting a photo cannot undo the
+                        // visual favorite state.
+                        for (auto& rec : g_gal.currentRecords) {
+                            if (rec.path == act.targetPath) rec.starred = act.starred;
+                        }
+                        for (auto* item : g_gal.timeline.flatAllItems) {
+                            if (item && item->record.path == act.targetPath) {
+                                item->record.starred = act.starred;
+                            }
+                        }
+                        if (g_gal.ui.selectedPath == act.targetPath) {
+                            g_gal.ui.selectedRecord.starred = act.starred;
+                        }
+                    } else {
+                        // Roll back the optimistic UI state if persistence
+                        // failed instead of showing a favorite that was lost.
+                        int previous = act.starred >= 0 ? 1 - act.starred : 0;
+                        for (auto& rec : g_gal.currentRecords) {
+                            if (rec.path == act.targetPath) rec.starred = previous;
+                        }
+                        for (auto* item : g_gal.timeline.flatAllItems) {
+                            if (item && item->record.path == act.targetPath) {
+                                item->record.starred = previous;
+                            }
+                        }
+                        if (g_gal.ui.selectedPath == act.targetPath) {
+                            g_gal.ui.selectedRecord.starred = previous;
+                        }
+                    }
                     if (g_gal.ui.currentTab == TAB_FAVORITES) {
                         refreshRecords();
                     }
@@ -392,6 +468,10 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
                 g_gal.ui.searchActive = false;   // keep the results, drop focus
                 return;
             }
+            // Printable input arrives through charCallback. Every remaining
+            // physical key is consumed here so F, Space, arrows, Tab, and
+            // other gallery bindings cannot fire while the field has focus.
+            return;
         }
 
         if ((key == GLFW_KEY_F && (mods & GLFW_MOD_CONTROL)) ||
@@ -411,13 +491,7 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
             // Escape always leaves full-screen view first - nothing else can
             // swallow it while a photo is open.
             if (g_gal.ui.isFullScreenView) {
-                g_gal.ui.isFullScreenView = false;
-                g_gal.ui.showThemeMenu = false;
-                g_gal.ui.showZoomPopup = false;
-                g_gal.ui.fsZoom = 1.0f;
-                g_gal.ui.fsPanX = 0.0f;
-                g_gal.ui.fsPanY = 0.0f;
-                g_gal.ui.isFsDragging = false;
+                closeFullscreenAndRevealSelection();
             } else if (g_gal.ui.showShortcuts) {
                 g_gal.ui.showShortcuts = false;
             } else if (g_gal.ui.showThemeMenu) {
@@ -501,17 +575,11 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
             if (!g_gal.ui.isFullScreenView && !g_gal.timeline.flatAllItems.empty()) {
                 selectFlatIndex((int)g_gal.timeline.flatAllItems.size() - 1);
             }
-        } else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_F) {
-            if (!g_gal.ui.selectedPath.empty()) {
-                g_gal.ui.openFullScreen(g_gal.timeline.selectedFlatIndex, g_gal.currentRecords, g_gal.timeline);
-            }
-        } else if (key == GLFW_KEY_SPACE) {
-            if (!g_gal.ui.selectedPath.empty()) {
-                g_gal.db.toggleStarred(g_gal.ui.selectedPath);
-                g_gal.ui.selectedRecord.starred = 1 - g_gal.ui.selectedRecord.starred;
-                if (g_gal.ui.currentTab == TAB_FAVORITES) {
-                    refreshRecords();
-                }
+        } else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_F || key == GLFW_KEY_SPACE) {
+            if (!g_gal.currentRecords.empty()) {
+                int index = g_gal.timeline.selectedFlatIndex >= 0
+                          ? g_gal.timeline.selectedFlatIndex : 0;
+                g_gal.ui.openFullScreen(index, g_gal.currentRecords, g_gal.timeline);
             }
         } else if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) {
             float gridW = g_gal.ui.gridWidth((float)g_gal.windowW);
@@ -590,6 +658,9 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    int msaaSamples = std::clamp(SilverConfig::get().integer("display.msaaSamples", silver::defaults::msaaSamples),
+                                 0, silver::limits::maxMsaaSamples);
+    glfwWindowHint(GLFW_SAMPLES, msaaSamples);
 
     // Set Application ID & Class Context for Wayland & X11 (Prevents 'unknown' and ANR issues)
 #ifdef GLFW_WAYLAND_APP_ID
@@ -649,6 +720,7 @@ int main(int argc, char* argv[]) {
 
     glfwSetFramebufferSizeCallback(g_gal.window, framebufferSizeCallback);
     glfwSetWindowSizeCallback(g_gal.window, windowSizeCallback);
+    glfwSetWindowContentScaleCallback(g_gal.window, contentScaleCallback);
     glfwSetCursorPosCallback(g_gal.window, cursorPosCallback);
     glfwSetMouseButtonCallback(g_gal.window, mouseButtonCallback);
     glfwSetScrollCallback(g_gal.window, scrollCallback);
@@ -659,7 +731,9 @@ int main(int argc, char* argv[]) {
     g_gal.db.init();
     g_gal.font.init();
     g_gal.iconAtlas.init();
+    syncPixelScale();
     g_gal.bgShader.init();
+    if (msaaSamples > 0) glEnable(GL_MULTISAMPLE);
 
     // If custom directory passed on command line, add to search roots
     if (argc > 1) {
@@ -891,4 +965,3 @@ int main(int argc, char* argv[]) {
     glfwTerminate();
     return 0;
 }
-

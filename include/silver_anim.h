@@ -93,6 +93,7 @@ struct Rates {
     // Without this, a tile that scrolls in mid-transition pops into place while
     // its neighbours are still moving, so a reflow looks half-animated.
     float layoutMargin = 700.0f;
+    float maxVisibleLayoutTravel = 180.0f;
     float toastSeconds = 2.0f;
     float zoomPillSeconds = 2.0f;
 
@@ -138,6 +139,7 @@ inline void reloadFromConfig() {
     r.fadeEpsilon            = c.num("animation.fadeEpsilon", 0.005f);
     r.animateOffscreenTiles  = c.flag("animation.animateOffscreenTiles", false);
     r.layoutMargin           = std::max(0.0f, c.num("animation.layoutMargin", 700.0f));
+    r.maxVisibleLayoutTravel = std::max(0.0f, c.num("animation.maxVisibleLayoutTravel", 180.0f));
     r.toastSeconds           = c.num("animation.toastSeconds", 2.0f);
     r.zoomPillSeconds        = c.num("animation.zoomPillSeconds", 2.0f);
 

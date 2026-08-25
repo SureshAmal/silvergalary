@@ -2,6 +2,7 @@
 
 #include "gl_loader.h"
 #include "theme.h"
+#include "silver_constants.h"
 #include <string>
 #include <vector>
 #include <cmath>
@@ -64,14 +65,27 @@ public:
     void invalidateViewport() { viewportValid = false; }
 
     float pixelScale = 1.0f;
-    float requestedSize = 15.0f;   // in points, before scaling
+    float requestedSize = silver::defaults::baseFontPoints;   // in points, before scaling
 
     void setPixelScale(float scale) {
-        if (scale < 0.5f) scale = 1.0f;
+        if (scale < silver::defaults::minPixelScale) scale = 1.0f;
         if (std::abs(scale - pixelScale) < 0.01f) return;
         pixelScale = scale;
         viewportValid = false;
         applyTextConfig();
+    }
+
+    // Convert a layout coordinate to the nearest physical framebuffer pixel.
+    // Use this for static image edges and hairlines; animated surfaces keep
+    // their fractional coordinates so motion remains continuous.
+    float snapToPixel(float value) const {
+        return std::round(value * pixelScale) / pixelScale;
+    }
+
+    int cornerSegments(float radius) const {
+        int wanted = (int)std::ceil(radius * pixelScale * 0.35f);
+        return std::clamp(wanted, silver::limits::minCornerSegments,
+                          silver::limits::maxCornerSegments);
     }
 
     // Re-read text settings (size, hinting) and rebuild the atlas if needed.
@@ -139,7 +153,7 @@ public:
     int batchesLastFrame = 0;
     size_t verticesLastFrame = 0;
 
-    bool init(const char* fontPath = nullptr, float size = 15.0f) {
+    bool init(const char* fontPath = nullptr, float size = silver::defaults::baseFontPoints) {
         fontSize = size;
         requestedSize = size;
 
@@ -491,7 +505,7 @@ public:
         addRect(x + w - radius, y + radius, radius, h - 2 * radius, col);
 
         auto addCorner = [&](float cx, float cy, float startAngle) {
-            const int segments = 8;
+            const int segments = cornerSegments(radius);
             float step = (M_PI * 0.5f) / segments;
             for (int i = 0; i < segments; ++i) {
                 float a1 = startAngle + i * step;
@@ -531,7 +545,7 @@ public:
 
         // 4 smooth corner arcs
         auto addCornerBorder = [&](float cx, float cy, float startAngle) {
-            const int segments = 8;
+            const int segments = cornerSegments(radius);
             float step = (M_PI * 0.5f) / segments;
             for (int i = 0; i < segments; ++i) {
                 float a1 = startAngle + i * step;

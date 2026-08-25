@@ -133,7 +133,7 @@
   "animation": {
     "//": "enabled:false makes every transition instant.",
     "enabled": true,
-    "speedMultiplier": 2.35,
+    "speedMultiplier": 1,
     "regroupStartScale": 0.88,
     "regroupEnterOffset": 24,
     "regroupMaxSizeRatio": 1.18,

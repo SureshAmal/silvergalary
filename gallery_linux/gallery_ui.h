@@ -917,6 +917,17 @@ public:
         timeline.selectItem(selectedPath);
         thumbs.requestThumbnail(selectedPath, true);
         fullResLoader.requestPrimaryImage(selectedPath);
+
+        std::vector<std::string> nearby;
+        nearby.reserve(7);
+        nearby.push_back(selectedPath);
+        for (int distance = 1; distance <= 3; ++distance) {
+            if (index + distance < (int)records.size())
+                nearby.push_back(records[(size_t)(index + distance)].path);
+            if (index - distance >= 0)
+                nearby.push_back(records[(size_t)(index - distance)].path);
+        }
+        fullResLoader.updatePreloadPaths(nearby);
     }
 
     GalleryUIAction handleMouseDown(float mx, float my, TimelineManager& timeline,
@@ -3208,6 +3219,7 @@ public:
 
         // Draw High-Res / Thumbnail Preview
         GLuint drawTexId = highResPreview.id ? highResPreview.id : 0;
+        float drawU0 = 0.0f, drawV0 = 0.0f, drawU1 = 1.0f, drawV1 = 1.0f;
         int imgW = highResPreview.width > 0 ? highResPreview.width : selectedRecord.width;
         int imgH = highResPreview.height > 0 ? highResPreview.height : selectedRecord.height;
 
@@ -3215,6 +3227,10 @@ public:
             auto it = thumbs.cache.find(selectedPath);
             if (it != thumbs.cache.end() && it->second.ready) {
                 drawTexId = it->second.texId;
+                if (it->second.atlasSlot >= 0) {
+                    drawU0 = it->second.atlasU0; drawV0 = it->second.atlasV0;
+                    drawU1 = it->second.atlasU1; drawV1 = it->second.atlasV1;
+                }
                 if (imgW <= 0) imgW = it->second.width;
                 if (imgH <= 0) imgH = it->second.height;
             }
@@ -3245,13 +3261,13 @@ public:
 
             font.beginBatch();
             UIVertex v[6] = {
-                { px, py, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
-                { px + finalW, py, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
-                { px + finalW, py + finalH, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px, py, drawU0, drawV0, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px + finalW, py, drawU1, drawV0, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px + finalW, py + finalH, drawU1, drawV1, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
 
-                { px, py, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
-                { px + finalW, py + finalH, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
-                { px, py + finalH, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px, py, drawU0, drawV0, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px + finalW, py + finalH, drawU1, drawV1, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px, py + finalH, drawU0, drawV1, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
             };
             font.vertices.insert(font.vertices.end(), v, v + 6);
             font.render(windowW, windowH, drawTexId);
@@ -3506,6 +3522,7 @@ public:
         // until its matching full-resolution image is ready.
         bool highResMatches = highResPreview.id && highResPreview.meta.filePath == selectedPath;
         GLuint drawTexId = highResMatches ? highResPreview.id : 0;
+        float drawU0 = 0.0f, drawV0 = 0.0f, drawU1 = 1.0f, drawV1 = 1.0f;
         int imgW = highResMatches ? highResPreview.width : selectedRecord.width;
         int imgH = highResMatches ? highResPreview.height : selectedRecord.height;
 
@@ -3513,6 +3530,10 @@ public:
             auto it = thumbs.cache.find(selectedPath);
             if (it != thumbs.cache.end() && it->second.ready) {
                 drawTexId = it->second.texId;
+                if (it->second.atlasSlot >= 0) {
+                    drawU0 = it->second.atlasU0; drawV0 = it->second.atlasV0;
+                    drawU1 = it->second.atlasU1; drawV1 = it->second.atlasV1;
+                }
                 if (imgW <= 0) imgW = it->second.width;
                 if (imgH <= 0) imgH = it->second.height;
             }
@@ -3561,13 +3582,13 @@ public:
 
             font.beginBatch();
             UIVertex v[6] = {
-                { ix, iy, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix + scaleW, iy, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix + scaleW, iy + scaleH, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix, iy, drawU0, drawV0, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix + scaleW, iy, drawU1, drawV0, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix + scaleW, iy + scaleH, drawU1, drawV1, 1.0f, 1.0f, 1.0f, anim, 2.0f },
 
-                { ix, iy, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix + scaleW, iy + scaleH, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix, iy + scaleH, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix, iy, drawU0, drawV0, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix + scaleW, iy + scaleH, drawU1, drawV1, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix, iy + scaleH, drawU0, drawV1, 1.0f, 1.0f, 1.0f, anim, 2.0f },
             };
             font.vertices.insert(font.vertices.end(), v, v + 6);
             font.render(windowW, windowH, drawTexId);

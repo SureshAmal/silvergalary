@@ -147,6 +147,36 @@ public:
         m_cv.notify_all();
     }
 
+    // Variant for callers that already know the small navigation window. It
+    // avoids constructing a path vector for an entire 10k-photo gallery every
+    // time the user presses Next.
+    void updatePreloadPaths(const std::vector<std::string>& desired) {
+        if (desired.empty()) return;
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        for (auto it = cache.begin(); it != cache.end();) {
+            if (std::find(desired.begin(), desired.end(), it->first) == desired.end())
+                it = cache.erase(it);
+            else
+                ++it;
+        }
+        preloadQueue.erase(std::remove_if(preloadQueue.begin(), preloadQueue.end(),
+            [&](const std::string& path) {
+                return std::find(desired.begin(), desired.end(), path) == desired.end();
+            }), preloadQueue.end());
+
+        for (const std::string& path : desired) {
+            auto it = cache.find(path);
+            if (it != cache.end() && (it->second->ready || it->second->inProgress)) continue;
+            auto item = std::make_shared<PreloadedImage>();
+            item->path = path;
+            item->inProgress = true;
+            cache[path] = item;
+            preloadQueue.push_back(path);
+        }
+        m_cv.notify_all();
+    }
+
     std::shared_ptr<PreloadedImage> getIfReady(const std::string& path) {
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = cache.find(path);

@@ -2,7 +2,7 @@
   "//": "SilverGallery configuration. Every value here is live-reloaded on save.",
   "layout": {
     "topBarHeight": 60,
-    "sidebarWidth": 290,
+    "sidebarWidth": 360,
     "sidebarInnerPadding": 16,
     "contentTopOffset": 70,
     "bottomPadding": 60,
@@ -12,8 +12,8 @@
     "zoomPillRightMargin": 20
   },
   "grid": {
-    "gap": 9,
-    "sidePadding": 12,
+    "gap": 12,
+    "sidePadding": 25,
     "sectionHeaderHeight": 46,
     "sectionSpacing": 20,
     "sectionBottomPadding": 16,
@@ -98,11 +98,11 @@
   },
   "icons": {
     "//": "Lucide icon weight. 1.0 = upstream 2px stroke; raise for heavier icons.",
-    "strokeScale": 1.05
+    "strokeScale": 1.1
   },
   "text": {
     "//": "Text rendering. hinting: light (GTK/Qt-style, crispest for UI) | normal | none | mono.",
-    "hinting": "light",
+    "hinting": "normal",
     "forceAutohint": true,
     "//pixelSize": "Interface text size in points; the whole UI scales with it.",
     "pixelSize": 15

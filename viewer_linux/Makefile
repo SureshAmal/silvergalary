@@ -1,5 +1,9 @@
 CXX ?= g++
 CXXFLAGS ?= -std=c++17 -O3 -Wall -Wno-unused-function -Wno-unused-result
+# Suppress warnings originating in vendored stb/NanoSVG only. Application
+# sources retain the normal warning policy.
+VENDOR_WARNINGS = -Wno-sign-compare -Wno-unused-but-set-variable \
+	-Wno-maybe-uninitialized -Wno-stringop-overflow
 INCLUDES = -I../include -I../include/easyexif -I../include/GLFW
 LIBS = ../lib/libglfw3.a -lGL -lm -lpthread -ldl
 
@@ -22,6 +26,15 @@ ifeq ($(shell $(PKG_CONFIG) --exists libwebp && echo 1),1)
 CXXFLAGS += -DHAVE_WEBP
 INCLUDES += $(shell $(PKG_CONFIG) --cflags libwebp)
 LIBS += $(shell $(PKG_CONFIG) --libs libwebp)
+else
+# The runtime and development packages are split on Fedora. We vendor the WebP
+# headers, so a present ABI-compatible runtime is sufficient for decoding.
+WEBP_RUNTIME := $(shell $(CXX) -print-file-name=libwebp.so.7)
+ifneq ($(WEBP_RUNTIME),libwebp.so.7)
+CXXFLAGS += -DHAVE_WEBP
+INCLUDES += -I../include/webp
+LIBS += -l:libwebp.so.7
+endif
 endif
 
 ifeq ($(shell $(PKG_CONFIG) --exists libavif && echo 1),1)
@@ -68,7 +81,7 @@ all: $(TARGET)
 
 ../lib/thirdparty.o: ../src/silver_thirdparty.cpp ../include/stb_image.h ../include/stb_truetype.h ../include/stb_image_resize.h ../include/stb_image_write.h ../include/stb_rect_pack.h ../include/nanosvg.h ../include/nanosvgrast.h
 	@mkdir -p ../lib
-	$(CXX) $(CXXFLAGS) $(PKG_CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(VENDOR_WARNINGS) $(PKG_CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(TARGET): $(SRCS) $(HEADERS) $(VENDOR) ../lib/libglfw3.a
 	@mkdir -p ../bin

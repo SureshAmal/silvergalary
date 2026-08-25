@@ -162,12 +162,13 @@ static void panToMinimapNorm(float normX, float normY) {
 }
 
 static void applyLoadedImageMeta(const ImageMetadata& meta) {
-    // EXIF orientation is baked into the decoded pixels by the codec layer, so
-    // the view starts unrotated.
-    g_app.targetRotation = 0.0f;
-    g_app.rotation = 0.0f;
-
-    fitToWindow(true);
+    // The header probe already established the initial fitted transform when
+    // this file was selected. Recalculate the fit reference for the final
+    // decoded dimensions, but do not overwrite the live transform: the user
+    // may have zoomed, panned or rotated the thumbnail while decoding. The old
+    // fitToWindow(true) here made those controls appear disabled because every
+    // completed decode silently reset them.
+    calculateFitParameters(g_app.fitScale, g_app.fitPosX, g_app.fitPosY);
 
     g_app.ui.thumbs.centerOnIndex(g_app.folder.currentIndex, g_app.folder.count(),
                                   (float)g_app.windowW, g_app.ui.thumbW, g_app.ui.thumbGap);
@@ -186,11 +187,26 @@ static void loadCurrentFile() {
     std::string path = g_app.folder.currentPath();
     g_app.ui.notifyUserActivity();
 
+    // Never draw the previous photo using the next photo's dimensions. That
+    // made rapid Left/Right navigation look like one image was repeatedly
+    // growing and shrinking while decoding caught up. Drop the old GPU texture
+    // first; the render loop can immediately use this path's thumbnail instead.
+    g_app.currentImage.unload();
+    g_app.ui.thumbs.requestThumbnail(path, true);
+
     // 1. Fast Header Probe: Instant image dimensions, layout & fitting in microseconds!
     // This guarantees window resizing, zooming, and smooth interaction work immediately
     // even while the high-resolution pixel buffer is decoding in the background!
     g_app.currentImage.probeHeader(path);
-    fitToWindow();
+    // A file change is a cut, not a zoom gesture. Snap the transform to the new
+    // image so navigation remains visually stable even across very different
+    // aspect ratios and resolutions.
+    g_app.targetRotation = g_app.rotation = 0.0f;
+    g_app.rotationVel = 0.0f;
+    fitToWindow(true);
+    g_app.scaleVel = 0.0f;
+    g_app.posVelX = 0.0f;
+    g_app.posVelY = 0.0f;
 
     // Update window title immediately
     char titleBuf[512];
@@ -218,6 +234,7 @@ static void loadCurrentFile() {
         if (g_app.currentImage.uploadPixels(preloaded->data, preloaded->width, preloaded->height, preloaded->meta)) {
             g_app.currentImage.setFiltering(g_app.nearestFilter);
             applyLoadedImageMeta(preloaded->meta);
+            g_app.preloader.discardUploadedPixels(path);
         }
     } else {
         // Asynchronous Large-Image Background Loader (Zero Main Thread Stalling!)
@@ -301,9 +318,12 @@ static void mouseButtonCallback(GLFWwindow* window, int button, int action, int 
         // Presentation Mode Navigation via Mouse Click
         if (g_app.ui.presentationMode) {
             if (button == GLFW_MOUSE_BUTTON_LEFT) {
-                if (g_app.folder.next()) loadCurrentFile();
-            } else if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-                if (g_app.folder.prev()) loadCurrentFile();
+                float zoneW = std::min(180.0f, (float)g_app.windowW * 0.22f);
+                if (g_app.mouseX <= zoneW) {
+                    if (g_app.folder.prev()) loadCurrentFile();
+                } else if (g_app.mouseX >= (float)g_app.windowW - zoneW) {
+                    if (g_app.folder.next()) loadCurrentFile();
+                }
             }
             return;
         }
@@ -429,11 +449,20 @@ static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
         return;
     }
 
-    // 3. Touchpad Pinch-to-Zoom / Two-Finger Vertical Touch Scroll
-    // Smoothly zooms in/out centered directly at the mouse cursor
-    if (yoffset != 0.0) {
+    // 3. Pinch-to-zoom. GLFW does not expose a dedicated Wayland/X11 pinch
+    // callback; desktop touchpad stacks conventionally deliver pinch as
+    // Ctrl+scroll. Plain two-finger vertical scrolling must not zoom.
+    bool pinchGesture = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                        glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+    if (pinchGesture && yoffset != 0.0) {
         float factor = powf(1.08f, (float)yoffset);
         zoomAtCursor(factor);
+        return;
+    }
+
+    // Ordinary two-finger vertical movement pans a zoomed image vertically.
+    if (yoffset != 0.0 && g_app.targetScale > g_app.fitScale * 1.05f) {
+        g_app.targetPosY += (float)yoffset * 32.0f;
     }
 
     // 4. Two-Finger Horizontal Slide
@@ -782,6 +811,12 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
+    // The viewer's filmstrip uses 60px tiles and does not need the gallery's
+    // much larger texture pool. Mesa may mirror texture storage in process RSS,
+    // so a 256 MiB GPU budget can appear as roughly 400-500 MiB of RAM.
+    g_app.ui.thumbs.setMemoryBudgetMegabytes(
+        SilverConfig::get().integer("viewer.thumbnailMemoryMegabytes", 64));
+
     g_app.preloader.init();
 
     // Load initial target file / directory
@@ -829,12 +864,16 @@ int main(int argc, char* argv[]) {
                 if (g_app.currentImage.uploadPixels(preloaded->data, preloaded->width, preloaded->height, preloaded->meta)) {
                     g_app.currentImage.setFiltering(g_app.nearestFilter);
                     applyLoadedImageMeta(preloaded->meta);
+                    g_app.preloader.discardUploadedPixels(currentPath);
                 }
             }
         }
 
         // Presentation Mode & Fullscreen Auto-Hide Cursor
-        bool shouldHideCursor = g_app.ui.presentationMode || (g_app.isFullscreen && g_app.ui.uiVisibilityAlpha < 0.05f);
+        // Presentation mode has hover navigation zones, so its cursor must
+        // remain available. Fullscreen chrome still auto-hides as before.
+        bool shouldHideCursor = !g_app.ui.presentationMode &&
+                                g_app.isFullscreen && g_app.ui.uiVisibilityAlpha < 0.05f;
         if (shouldHideCursor) {
             if (!g_app.cursorIsHidden) {
                 glfwSetInputMode(g_app.window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
@@ -910,7 +949,8 @@ int main(int argc, char* argv[]) {
             g_app.posX, g_app.posY,
             curRotInt,
             g_app.nearestFilter, g_app.pixelGrid,
-            g_app.preloader.isCurrentLoading.load(),
+            g_app.folder.hasFiles() &&
+                g_app.preloader.isLoadingPath(g_app.folder.currentPath()),
             g_app.currentImage.id
         );
         g_app.ui.font.endFrame();

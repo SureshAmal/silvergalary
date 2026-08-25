@@ -28,6 +28,7 @@ struct PreloadedImage {
     ImageMetadata meta;
     bool ready = false;
     bool inProgress = false;
+    bool failed = false;
 
     ~PreloadedImage() {
         if (data) {
@@ -111,40 +112,27 @@ public:
     void updatePreloadTargets(const std::vector<std::string>& fileList, int currentIdx) {
         if (fileList.empty()) return;
 
-        int total = (int)fileList.size();
-        std::vector<std::string> desired;
-
-        // Keep current, next 3, and previous 3 images in RAM cache
-        int offsets[] = { 0, 1, -1, 2, -2, 3, -3 };
-        for (int off : offsets) {
-            int targetIdx = currentIdx + off;
-            if (targetIdx >= 0 && targetIdx < total) {
-                desired.push_back(fileList[targetIdx]);
-            }
-        }
+        if (currentIdx < 0 || currentIdx >= (int)fileList.size()) return;
+        const std::string& current = fileList[(size_t)currentIdx];
 
         std::lock_guard<std::mutex> lock(m_mutex);
-        // Evict unneeded images from cache
+        // Full-resolution RGBA is extremely expensive (a single 5338x3559
+        // photo is ~72.5 MiB). Thumbnails already make neighboring navigation
+        // instant, so retain only the image that is actually being displayed.
         for (auto it = cache.begin(); it != cache.end();) {
-            if (std::find(desired.begin(), desired.end(), it->first) == desired.end()) {
+            if (it->first != current) {
                 it = cache.erase(it);
             } else {
                 ++it;
             }
         }
 
-        // Queue newly desired images
-        for (const auto& path : desired) {
-            if (cache.find(path) == cache.end()) {
-                auto item = std::make_shared<PreloadedImage>();
-                item->path = path;
-                item->ready = false;
-                item->inProgress = true;
-                cache[path] = item;
-                preloadQueue.push_back(path);
-            }
-        }
-        m_cv.notify_all();
+        // Drop queued neighbor work left by an older navigation request. A
+        // worker already decoding one may finish, but its pixels are discarded
+        // because its cache entry was erased above.
+        preloadQueue.erase(std::remove_if(preloadQueue.begin(), preloadQueue.end(),
+                                          [&](const std::string& p) { return p != current; }),
+                           preloadQueue.end());
     }
 
     std::shared_ptr<PreloadedImage> getIfReady(const std::string& path) {
@@ -157,6 +145,20 @@ public:
             return it->second;
         }
         return nullptr;
+    }
+
+    bool isLoadingPath(const std::string& path) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return isCurrentLoading.load() && currentLoadingPath == path;
+    }
+
+    // uploadPixels copies into OpenGL, so keeping the same full-resolution CPU
+    // allocation afterward only doubles memory. The shared_ptr returned by
+    // getIfReady keeps it alive until the current upload call finishes.
+    void discardUploadedPixels(const std::string& path) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = cache.find(path);
+        if (it != cache.end() && it->second->ready) cache.erase(it);
     }
 
     void workerLoop() {
@@ -303,10 +305,30 @@ public:
                         it->second->meta = meta;
                         it->second->ready = true;
                         it->second->inProgress = false;
+                        it->second->failed = false;
                     } else {
                         silvercodec::freePixels(raw);
                     }
+                } else {
+                    // A corrupt or unsupported file is a completed failure, not
+                    // an operation that remains "loading" forever.
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    auto it = cache.find(path);
+                    if (it != cache.end()) {
+                        it->second->inProgress = false;
+                        it->second->failed = true;
+                    }
+                    if (path == currentLoadingPath) isCurrentLoading = false;
+                    std::cerr << "[SilverViewer] Could not decode image: " << path << std::endl;
                 }
+            } else {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto it = cache.find(path);
+                if (it != cache.end()) {
+                    it->second->inProgress = false;
+                    it->second->failed = true;
+                }
+                if (path == currentLoadingPath) isCurrentLoading = false;
             }
         }
     }

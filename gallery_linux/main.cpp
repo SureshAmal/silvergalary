@@ -24,6 +24,7 @@
 #include "../viewer_linux/icons.h"
 #include "silver_config.h"
 #include "silver_anim.h"
+#include "silver_single_instance.h"
 #include "db.h"
 #include "scanner.h"
 #include "timeline.h"
@@ -54,6 +55,7 @@ struct GalleryApp {
     bool redrawPending = true;      // drives poll-vs-wait in the main loop
     bool showRenderStats = false;   // SILVER_RENDER_STATS=1
     bool showThumbStats = false;    // SILVER_THUMB_STATS=1
+    SilverSingleInstance singleInstance;
 };
 
 static GalleryApp g_gal;
@@ -142,6 +144,35 @@ static void copyPathToClipboard(const std::string& path) {
     std::cout << "Copied to clipboard: " << path << std::endl;
 }
 
+// Keep the database, the query result, the timeline tile and the inspector's
+// private copy in sync. Previously each input path updated a different subset,
+// so Space could change SQLite while the visible heart kept its old state.
+static void toggleStarredEverywhere(const std::string& path) {
+    if (path.empty() || !g_gal.db.toggleStarred(path)) return;
+
+    int newValue = -1;
+    for (auto& rec : g_gal.currentRecords) {
+        if (rec.path == path) {
+            rec.starred = 1 - rec.starred;
+            newValue = rec.starred;
+            break;
+        }
+    }
+    for (TimelineItem* item : g_gal.timeline.flatAllItems) {
+        if (item && item->record.path == path) {
+            if (newValue < 0) newValue = 1 - item->record.starred;
+            item->record.starred = newValue;
+        }
+    }
+    if (g_gal.ui.selectedPath == path && newValue >= 0) {
+        g_gal.ui.selectedRecord.starred = newValue;
+    }
+
+    // In Favorites the item must disappear, so rebuild instead of updating it
+    // in place. Other tabs retain their scroll position and selection.
+    if (g_gal.ui.currentTab == TAB_FAVORITES) refreshRecords();
+}
+
 // -----------------------------------------------------------------------------
 // GLFW Callbacks
 // -----------------------------------------------------------------------------
@@ -217,10 +248,7 @@ static void mouseButtonCallback(GLFWwindow* window, int button, int action, int 
                     launchViewer(act.targetPath);
                     break;
                 case GalleryUIAction::TOGGLE_STAR:
-                    g_gal.db.toggleStarred(act.targetPath);
-                    if (g_gal.ui.currentTab == TAB_FAVORITES) {
-                        refreshRecords();
-                    }
+                    toggleStarredEverywhere(act.targetPath);
                     break;
                 case GalleryUIAction::START_SCAN:
                     g_gal.scanner.startScan(g_gal.db, true);
@@ -392,6 +420,9 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
                 g_gal.ui.searchActive = false;   // keep the results, drop focus
                 return;
             }
+            // Printable keys belong exclusively to the search field. In
+            // particular Space must type a space, not toggle a photo's heart.
+            return;
         }
 
         if ((key == GLFW_KEY_F && (mods & GLFW_MOD_CONTROL)) ||
@@ -506,12 +537,9 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
                 g_gal.ui.openFullScreen(g_gal.timeline.selectedFlatIndex, g_gal.currentRecords, g_gal.timeline);
             }
         } else if (key == GLFW_KEY_SPACE) {
-            if (!g_gal.ui.selectedPath.empty()) {
-                g_gal.db.toggleStarred(g_gal.ui.selectedPath);
-                g_gal.ui.selectedRecord.starred = 1 - g_gal.ui.selectedRecord.starred;
-                if (g_gal.ui.currentTab == TAB_FAVORITES) {
-                    refreshRecords();
-                }
+            // Do not repeatedly flip the favorite while the key is held.
+            if (action == GLFW_PRESS && !g_gal.ui.selectedPath.empty()) {
+                toggleStarredEverywhere(g_gal.ui.selectedPath);
             }
         } else if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) {
             float gridW = g_gal.ui.gridWidth((float)g_gal.windowW);
@@ -566,6 +594,14 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
 
 int main(int argc, char* argv[]) {
     std::cout << "Starting SilverGallery (Timeline Image Organizer & Fast SQLite Engine)..." << std::endl;
+
+    // SilverGallery is per-user singleton. A later launch asks this process to
+    // restore/focus its existing window, then exits before initializing GLFW or
+    // touching the database. SilverViewer intentionally remains multi-instance.
+    if (!g_gal.singleInstance.becomePrimary("com.silvergallery.app")) {
+        std::cout << "SilverGallery is already running; activating it." << std::endl;
+        return 0;
+    }
 
     // Load every layout / spacing / animation value from JSON before anything
     // is sized or animated.
@@ -765,6 +801,7 @@ int main(int argc, char* argv[]) {
     // A worker finishing a decode must be able to wake the event loop, or the
     // thumbnail would not appear until the idle timeout expired.
     g_gal.ui.thumbs.onWorkReady = []() { glfwPostEmptyEvent(); };
+    g_gal.singleInstance.setWakeFunction([]() { glfwPostEmptyEvent(); });
 
     // Main Render Loop
     while (!glfwWindowShouldClose(g_gal.window)) {
@@ -783,6 +820,15 @@ int main(int argc, char* argv[]) {
         float dt = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
         dt = std::min(dt, 0.1f);
+
+        if (g_gal.singleInstance.consumeActivation()) {
+            if (glfwGetWindowAttrib(g_gal.window, GLFW_ICONIFIED)) {
+                glfwRestoreWindow(g_gal.window);
+            }
+            glfwFocusWindow(g_gal.window);
+            glfwRequestWindowAttention(g_gal.window);
+            g_gal.redrawPending = true;
+        }
 
         // Fold in freshly indexed photos while a scan is still running, but at
         // most a couple of times a second so the grid never stutters.
@@ -887,8 +933,8 @@ int main(int argc, char* argv[]) {
 
     g_gal.scanner.stop();
     g_gal.db.close();
+    g_gal.singleInstance.stop();
     glfwDestroyWindow(g_gal.window);
     glfwTerminate();
     return 0;
 }
-

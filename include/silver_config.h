@@ -455,6 +455,11 @@ static const char* kSilverDefaultConfig = R"JSON({
     "inspectorThreads": 0,
     "refreshIntervalSeconds": 0.6,
     "pruneMissing": true
+  },
+
+  "viewer": {
+    "//thumbnailMemoryMegabytes": "Viewer-only GPU budget; gallery keeps thumbnails.maxResidentMegabytes.",
+    "thumbnailMemoryMegabytes": 64
   }
 })JSON";
 

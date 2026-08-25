@@ -518,7 +518,32 @@ public:
         float uiAlpha = uiVisibilityAlpha;
 
         if (presentationMode) {
-            return; // In presentation mode, view ONLY the clean image canvas
+            // Keep the canvas clean until the pointer enters an edge navigation
+            // zone. Only available directions are shown.
+            float zoneW = std::min(180.0f, (float)windowW * 0.22f);
+            bool hoverPrev = currentFileIdx > 0 && mouseX <= zoneW;
+            bool hoverNext = currentFileIdx + 1 < (int)fileList.size() &&
+                             mouseX >= (float)windowW - zoneW;
+            if (hoverPrev || hoverNext) {
+                float size = 52.0f * uiScale;
+                float x = hoverPrev ? 20.0f * uiScale
+                                    : (float)windowW - size - 20.0f * uiScale;
+                float y = ((float)windowH - size) * 0.5f;
+                font.beginBatch();
+                font.addRoundedRect(x + 2.0f, y + 2.0f, size, size, size * 0.5f,
+                                    Color4(0, 0, 0, 0.35f));
+                font.addRoundedRect(x, y, size, size, size * 0.5f,
+                                    Color4(0.06f, 0.08f, 0.10f, 0.78f));
+                font.addRoundedBorder(x, y, size, size, size * 0.5f, 1.0f,
+                                      Color4(1, 1, 1, 0.20f));
+                float iconSize = 26.0f * uiScale;
+                iconAtlas.drawIcon(font, hoverPrev ? ICON_CHEVRON_LEFT : ICON_CHEVRON_RIGHT,
+                                   x + (size - iconSize) * 0.5f,
+                                   y + (size - iconSize) * 0.5f,
+                                   iconSize, iconSize, Color4(1, 1, 1, 0.95f));
+                font.render(windowW, windowH, 0, iconAtlas.textureId);
+            }
+            return;
         }
 
         // =============================================================
@@ -638,27 +663,22 @@ public:
         // =============================================================
         if (isImageDecoding && !isGridView) {
             font.beginBatch();
-            float sw = 220.0f;
-            float sh = 36.0f;
+            float sw = 42.0f * uiScale;
+            float sh = 42.0f * uiScale;
             float sx = ((float)windowW - sw) * 0.5f;
             float sy = topBarH + 20.0f;
 
             Color4 sBg = pal.cardBg;
             sBg.a = 0.94f;
-            font.addRoundedRect(sx + 3, sy + 3, sw, sh, 18.0f, Color4(0, 0, 0, 0.35f));
-            font.addRoundedRect(sx, sy, sw, sh, 18.0f, sBg);
-            font.addRoundedBorder(sx, sy, sw, sh, 18.0f, 1.0f, pal.cardBorder);
-
-            float pulse = 0.5f + 0.5f * sinf(shimmerPhase);
-            Color4 pulseCol = pal.accent;
-            pulseCol.a = 0.4f + 0.5f * pulse;
-            font.addRoundedRect(sx + 14.0f, sy + 16.0f, 16.0f, 4.0f, 2.0f, pulseCol);
-
-            font.render(windowW, windowH);
-
-            font.beginBatch();
-            font.addTextVCentered(sx + 40.0f * uiScale, sy, sh, "Decoding Full Resolution...", pal.textPrimary);
-            font.render(windowW, windowH);
+            font.addRoundedRect(sx + 2, sy + 2, sw, sh, sh * 0.5f, Color4(0, 0, 0, 0.35f));
+            font.addRoundedRect(sx, sy, sw, sh, sh * 0.5f, sBg);
+            font.addRoundedBorder(sx, sy, sw, sh, sh * 0.5f, 1.0f, pal.cardBorder);
+            float iconSize = 22.0f * uiScale;
+            iconAtlas.drawIconRotated(font, ICON_LOADER,
+                                      sx + (sw - iconSize) * 0.5f,
+                                      sy + (sh - iconSize) * 0.5f,
+                                      iconSize, iconSize, shimmerPhase * 2.2f, pal.accent);
+            font.render(windowW, windowH, 0, iconAtlas.textureId);
         }
 
         // =============================================================

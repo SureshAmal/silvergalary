@@ -2,6 +2,11 @@ CC ?= gcc
 CXX ?= g++
 CFLAGS ?= -O3 -Wall -Wno-unused-function -Wno-unused-result
 CXXFLAGS ?= -std=c++17 -O3 -Wall -Wno-unused-function -Wno-unused-result
+# Vendored stb/NanoSVG releases trigger a handful of GCC diagnostics inside
+# their implementation. Keep these suppressions local to thirdparty.o so our
+# own code continues to build with the full warning set.
+VENDOR_WARNINGS = -Wno-sign-compare -Wno-unused-but-set-variable \
+	-Wno-maybe-uninitialized -Wno-stringop-overflow
 INCLUDES = -I../include -I../include/easyexif -I../include/GLFW -I../viewer_linux
 LIBS = ../lib/sqlite3.o ../lib/libglfw3.a -lGL -lm -lpthread -ldl
 
@@ -24,6 +29,17 @@ ifeq ($(shell $(PKG_CONFIG) --exists libwebp && echo 1),1)
 CXXFLAGS += -DHAVE_WEBP
 INCLUDES += $(shell $(PKG_CONFIG) --cflags libwebp)
 LIBS += $(shell $(PKG_CONFIG) --libs libwebp)
+else
+# Fedora installs the versioned runtime separately from libwebp-devel. The
+# repository already vendors the public headers, so use the runtime soname when
+# it is available instead of advertising WebP and then handing it to stb_image
+# (which cannot decode WebP).
+WEBP_RUNTIME := $(shell $(CXX) -print-file-name=libwebp.so.7)
+ifneq ($(WEBP_RUNTIME),libwebp.so.7)
+CXXFLAGS += -DHAVE_WEBP
+INCLUDES += -I../include/webp
+LIBS += -l:libwebp.so.7
+endif
 endif
 
 ifeq ($(shell $(PKG_CONFIG) --exists libavif && echo 1),1)
@@ -70,7 +86,7 @@ all: $(TARGET)
 
 ../lib/thirdparty.o: ../src/silver_thirdparty.cpp ../include/stb_image.h ../include/stb_truetype.h ../include/stb_image_resize.h ../include/stb_image_write.h ../include/stb_rect_pack.h ../include/nanosvg.h ../include/nanosvgrast.h
 	@mkdir -p ../lib
-	$(CXX) $(CXXFLAGS) $(PKG_CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(VENDOR_WARNINGS) $(PKG_CFLAGS) $(INCLUDES) -c $< -o $@
 
 ../lib/sqlite3.o: ../include/sqlite3.c
 	@mkdir -p ../lib

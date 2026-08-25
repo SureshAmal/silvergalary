@@ -129,6 +129,10 @@ public:
         useSharedCache = c.flag("thumbnails.useSharedCache", true);
     }
 
+    void setMemoryBudgetMegabytes(int megabytes) {
+        maxResidentBytes = (size_t)std::max(16, megabytes) * 1024ull * 1024ull;
+    }
+
     float scrollOffset = 0.0f;
     float targetScrollOffset = 0.0f;
     float scrollVelocity = 0.0f;
@@ -458,7 +462,7 @@ public:
         cv.notify_all();
     }
 
-    void preloadFolder(const std::vector<std::string>& files, int currentIdx, int edge = 512) {
+    void preloadFolder(const std::vector<std::string>& files, int currentIdx, int edge = 96) {
         std::lock_guard<std::mutex> lock(queueLock);
         if (files.empty()) return;
 

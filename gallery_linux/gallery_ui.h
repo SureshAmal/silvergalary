@@ -914,7 +914,6 @@ public:
             if (isInside(mx, my, fsFavBtnRect.x, fsFavBtnRect.y, fsFavBtnRect.w, fsFavBtnRect.h)) {
                 act.type = GalleryUIAction::TOGGLE_STAR;
                 act.targetPath = selectedPath;
-                selectedRecord.starred = 1 - selectedRecord.starred;
                 return act;
             }
             // Info Toggle
@@ -1006,8 +1005,16 @@ public:
             if (mx >= sbX && my > L.topBarH) {
                 // Close Sidebar Button
                 if (isInside(mx, my, sbCloseRect.x, sbCloseRect.y, sbCloseRect.w, sbCloseRect.h)) {
+                    std::string closingPath = selectedPath;
                     showSidebar = false;
-                    act.targetPath = selectedPath;   // anchor for the reflow
+                    // The explicit close button should close immediately. The
+                    // old slide-out kept intercepting/rendering for several
+                    // frames, which made the X appear not to work.
+                    sidebarAnim = 0.0f;
+                    sidebarVel = 0.0f;
+                    sidebarPrevTarget = 0.0f;
+                    selectedPath.clear();
+                    act.targetPath = closingPath;   // anchor for the reflow
                     timeline.clearSelection();
                     act.type = GalleryUIAction::CLOSE_SIDEBAR;
                     return act;
@@ -1029,7 +1036,6 @@ public:
                 if (isInside(mx, my, sbFavBtnRect.x, sbFavBtnRect.y, sbFavBtnRect.w, sbFavBtnRect.h)) {
                     act.type = GalleryUIAction::TOGGLE_STAR;
                     act.targetPath = selectedPath;
-                    selectedRecord.starred = 1 - selectedRecord.starred;
                     return act;
                 }
                 // Standalone Viewer Button
@@ -1260,10 +1266,6 @@ public:
             if (isInside(mx, my, starX, starY, starSize, starSize)) {
                 act.type = GalleryUIAction::TOGGLE_STAR;
                 act.targetPath = itm->record.path;
-                itm->record.starred = 1 - itm->record.starred;
-                if (selectedPath == itm->record.path) {
-                    selectedRecord.starred = itm->record.starred;
-                }
                 return act;
             } else {
                 auto now = std::chrono::steady_clock::now();
@@ -3529,4 +3531,3 @@ public:
         font.render(windowW, windowH, 0, iconAtlas.textureId);
     }
 };
-

@@ -60,6 +60,7 @@ enum IconType {
     ICON_STAR,
     ICON_STAR_FILLED,
     ICON_REFRESH,
+    ICON_LOADER,
     ICON_PHOTO,
     ICON_COPY,
     ICON_EXTERNAL_LINK,
@@ -197,6 +198,37 @@ public:
             { x0, y0, e->u0, e->v0, col.r, col.g, col.b, col.a, 3.0f },
             { x1, y1, e->u1, e->v1, col.r, col.g, col.b, col.a, 3.0f },
             { x0, y1, e->u0, e->v1, col.r, col.g, col.b, col.a, 3.0f },
+        };
+        r.vertices.insert(r.vertices.end(), v, v + 6);
+    }
+
+    void drawIconRotated(FontRenderer& r, IconType type, float x, float y,
+                         float w, float h, float radians, Color4 col) {
+        if (type < 0 || type >= ICON_COUNT) return;
+        int px = (int)std::lround(std::max(w, h) * pixelScale);
+        px = std::clamp(px, 4, 512);
+        const Entry* e = ensure(type, px);
+        if (!e) return;
+
+        float cx = x + w * 0.5f, cy = y + h * 0.5f;
+        float cs = std::cos(radians), sn = std::sin(radians);
+        auto point = [&](float px0, float py0, float& ox, float& oy) {
+            float dx = px0 - cx, dy = py0 - cy;
+            ox = cx + dx * cs - dy * sn;
+            oy = cy + dx * sn + dy * cs;
+        };
+        float x0, y0, x1, y1, x2, y2, x3, y3;
+        point(x,     y,     x0, y0);
+        point(x + w, y,     x1, y1);
+        point(x + w, y + h, x2, y2);
+        point(x,     y + h, x3, y3);
+        UIVertex v[6] = {
+            {x0,y0,e->u0,e->v0,col.r,col.g,col.b,col.a,3.0f},
+            {x1,y1,e->u1,e->v0,col.r,col.g,col.b,col.a,3.0f},
+            {x2,y2,e->u1,e->v1,col.r,col.g,col.b,col.a,3.0f},
+            {x0,y0,e->u0,e->v0,col.r,col.g,col.b,col.a,3.0f},
+            {x2,y2,e->u1,e->v1,col.r,col.g,col.b,col.a,3.0f},
+            {x3,y3,e->u0,e->v1,col.r,col.g,col.b,col.a,3.0f},
         };
         r.vertices.insert(r.vertices.end(), v, v + 6);
     }

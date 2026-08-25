@@ -59,7 +59,6 @@ struct AppState {
     float dragStartPosX = 0, dragStartPosY = 0;
 
     double lastClickTime = 0.0;
-    float swipeAccumX = 0.0f;
     bool cursorIsHidden = false;
 };
 
@@ -117,7 +116,7 @@ static void centerView() {
     g_app.ui.showToast("View Centered");
 }
 
-static void zoomAtCursor(float factor) {
+static void zoomAtPoint(float factor, float cursorX, float cursorY) {
     if ((!g_app.currentImage.isLoaded && g_app.currentImage.width <= 0) || g_app.ui.isGridView) return;
 
     float oldTargetScale = g_app.targetScale;
@@ -136,12 +135,34 @@ static void zoomAtCursor(float factor) {
         return;
     }
 
-    float cursorX = (float)g_app.mouseX;
-    float cursorY = (float)g_app.mouseY;
-
     g_app.targetPosX = cursorX - (cursorX - g_app.targetPosX) * (newTargetScale / oldTargetScale);
     g_app.targetPosY = cursorY - (cursorY - g_app.targetPosY) * (newTargetScale / oldTargetScale);
     g_app.targetScale = newTargetScale;
+}
+
+static void zoomAtCursor(float factor) {
+    zoomAtPoint(factor, (float)g_app.mouseX, (float)g_app.mouseY);
+}
+
+static double g_lastNativePinchScale = 1.0;
+static double g_horizontalSlideAccum = 0.0;
+static double g_lastHorizontalSlideAt = 0.0;
+static bool g_horizontalSlideTriggered = false;
+
+static void pinchCallback(GLFWwindow*, int phase, double scale,
+                          double centerX, double centerY, int fingers) {
+    if (fingers < 2) return;
+    g_app.redrawPending = true;
+    g_app.ui.notifyUserActivity();
+    if (phase == GLFW_PINCH_BEGIN) {
+        g_lastNativePinchScale = 1.0;
+        return;
+    }
+    if (phase == GLFW_PINCH_UPDATE && scale > 0.0) {
+        float factor = (float)(scale / g_lastNativePinchScale);
+        g_lastNativePinchScale = scale;
+        zoomAtPoint(factor, (float)centerX, (float)centerY);
+    }
 }
 
 static void panToMinimapNorm(float normX, float normY) {
@@ -450,30 +471,48 @@ static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
         return;
     }
 
-    // 3. Touchpad Pinch-to-Zoom / Two-Finger Vertical Touch Scroll
-    // Smoothly zooms in/out centered directly at the mouse cursor
-    if (yoffset != 0.0) {
-        float factor = powf(1.08f, (float)yoffset);
-        zoomAtCursor(factor);
+    // GLFW combines mouse-wheel and touchpad axis events. Discrete wheel
+    // notches zoom at the pointer; fractional touchpad motion remains panning.
+    const SilverConfig& gestureCfg = SilverConfig::get();
+    double roundedY = std::round(yoffset);
+    double wheelTolerance = gestureCfg.num("gestures.wheelDiscreteTolerance", 0.08f);
+    bool discreteWheel = yoffset != 0.0 &&
+                         std::abs(yoffset - roundedY) <= wheelTolerance;
+    if (discreteWheel) {
+        float step = gestureCfg.num("viewer.wheelZoomStep", 0.14f);
+        zoomAtCursor(std::pow(1.0f + step, (float)yoffset));
+        return;
     }
 
-    // 4. Two-Finger Horizontal Slide
-    // - If zoomed in: pans horizontally across image
-    // - If at fit view: swipes next / previous image
-    if (xoffset != 0.0) {
-        bool isZoomed = (g_app.targetScale > g_app.fitScale * 1.05f);
-        if (isZoomed) {
-            g_app.targetPosX += (float)xoffset * 32.0f;
-        } else {
-            g_app.swipeAccumX += (float)xoffset;
-            if (g_app.swipeAccumX > 3.0f) {
-                g_app.swipeAccumX = 0.0f;
-                if (g_app.folder.prev()) loadCurrentFile();
-            } else if (g_app.swipeAccumX < -3.0f) {
-                g_app.swipeAccumX = 0.0f;
-                if (g_app.folder.next()) loadCurrentFile();
+    // Native pinch owns touchpad zoom. Axis motion pans while enlarged.
+    bool isZoomed = (g_app.targetScale > g_app.fitScale * 1.05f);
+    if (isZoomed) {
+        float panSpeed = SilverConfig::get().num("gestures.panPixelsPerUnit", 32.0f);
+        if (xoffset != 0.0)
+            g_app.targetPosX += (float)xoffset * panSpeed;
+        if (yoffset != 0.0)
+            g_app.targetPosY += (float)yoffset * panSpeed;
+    } else if (xoffset != 0.0) {
+            const SilverConfig& cfg = SilverConfig::get();
+            double now = glfwGetTime();
+            if (g_lastHorizontalSlideAt > 0.0 &&
+                now - g_lastHorizontalSlideAt > cfg.num("gestures.slideResetSeconds", 0.18f)) {
+                g_horizontalSlideAccum = 0.0;
+                g_horizontalSlideTriggered = false;
             }
-        }
+            g_lastHorizontalSlideAt = now;
+            g_horizontalSlideAccum += xoffset;
+            double threshold = cfg.num("gestures.horizontalSlideThreshold", 4.0f);
+            if (!g_horizontalSlideTriggered && std::abs(g_horizontalSlideAccum) >= threshold) {
+                bool changed = g_horizontalSlideAccum > 0.0 ? g_app.folder.prev()
+                                                            : g_app.folder.next();
+                if (changed) loadCurrentFile();
+                g_horizontalSlideTriggered = true;
+            }
+    } else if (yoffset == 0.0) {
+        // Wayland emits a zero-valued frame when both touchpad axes stop.
+        g_horizontalSlideAccum = 0.0;
+        g_horizontalSlideTriggered = false;
     }
 }
 
@@ -791,6 +830,7 @@ int main(int argc, char* argv[]) {
     glfwSetCursorPosCallback(g_app.window, cursorPosCallback);
     glfwSetMouseButtonCallback(g_app.window, mouseButtonCallback);
     glfwSetScrollCallback(g_app.window, scrollCallback);
+    glfwSetPinchCallback(g_app.window, pinchCallback);
     glfwSetKeyCallback(g_app.window, keyCallback);
     glfwSetDropCallback(g_app.window, dropCallback);
 

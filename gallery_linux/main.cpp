@@ -55,6 +55,10 @@ struct GalleryApp {
     bool redrawPending = true;      // drives poll-vs-wait in the main loop
     bool showRenderStats = false;   // SILVER_RENDER_STATS=1
     bool showThumbStats = false;    // SILVER_THUMB_STATS=1
+    GLuint gpuTimerQueries[2] = { 0, 0 };
+    bool gpuTimerIssued[2] = { false, false };
+    int gpuTimerIndex = 0;
+    double gpuFrameMs = 0.0;
 };
 
 static GalleryApp g_gal;
@@ -208,16 +212,17 @@ static void framebufferSizeCallback(GLFWwindow* window, int w, int h) {
     g_gal.redrawPending = true;
 }
 
+static bool g_pendingWindowRelayout = false;
+
 static void windowSizeCallback(GLFWwindow* window, int w, int h) {
     g_gal.windowW = w;
     g_gal.windowH = h;
     syncPixelScale();
     g_gal.redrawPending = true;
-    float gridW = g_gal.ui.gridWidth((float)w);
-    bool hasBanner = (!g_gal.ui.activeFolderFilter.empty() && g_gal.ui.currentTab != TAB_FOLDERS);
-    // Resizing changes the column count; keep the selection (or nothing) anchored
-    // instead of letting the viewport jump somewhere unrelated.
-    g_gal.ui.relayoutKeepingAnchor(g_gal.timeline, gridW, hasBanner, (float)h, g_gal.ui.selectedPath);
+    // Polling can deliver a whole burst of intermediate compositor sizes.
+    // Defer the O(photo-count) layout and consume only the latest size once in
+    // the next render frame.
+    g_pendingWindowRelayout = true;
 }
 
 static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
@@ -232,6 +237,20 @@ static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
 
 static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     g_gal.redrawPending = true;
+    if (button == GLFW_MOUSE_BUTTON_MIDDLE && g_gal.ui.isFullScreenView) {
+        if (action == GLFW_PRESS) {
+            g_gal.isMouseDown = true;
+            g_gal.ui.isFsDragging = true;
+            g_gal.ui.fsDragStartX = (float)g_gal.mouseX;
+            g_gal.ui.fsDragStartY = (float)g_gal.mouseY;
+            g_gal.ui.fsOrigPanX = g_gal.ui.fsPanX;
+            g_gal.ui.fsOrigPanY = g_gal.ui.fsPanY;
+        } else if (action == GLFW_RELEASE) {
+            g_gal.isMouseDown = false;
+            g_gal.ui.handleMouseUp();
+        }
+        return;
+    }
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         if (action == GLFW_PRESS) {
             g_gal.isMouseDown = true;
@@ -320,6 +339,9 @@ static void mouseButtonCallback(GLFWwindow* window, int button, int action, int 
 }
 
 static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
+    static double horizontalAccum = 0.0;
+    static double lastHorizontalAt = 0.0;
+    static bool horizontalTriggered = false;
     g_gal.redrawPending = true;
     if (g_gal.ui.showSettings) {
         float maxScroll = g_gal.ui.settingsMaxScroll((float)g_gal.windowH);
@@ -332,12 +354,55 @@ static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
                    glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
 
     if (g_gal.ui.isFullScreenView) {
-        // Zoom in/out in fullscreen
         const SilverConfig& cfg = SilverConfig::get();
-        float zoomDelta = (float)yoffset * cfg.num("fullscreen.zoomStep", 0.15f);
-        g_gal.ui.fsZoom = std::clamp(g_gal.ui.fsZoom + zoomDelta,
-                                     cfg.num("fullscreen.minZoom", 0.2f),
-                                     cfg.num("fullscreen.maxZoom", 10.0f));
+
+        // Wayland sends a two-finger horizontal slide through xoffset.  Treat
+        // the whole kinetic stream as one gesture so inertia cannot skip over
+        // several photos. A quiet gap (or the compositor's zero stop frame)
+        // arms the next slide.
+        double now = glfwGetTime();
+        double resetAfter = cfg.num("gestures.slideResetSeconds", 0.18f);
+        if ((xoffset == 0.0 && yoffset == 0.0) ||
+            (lastHorizontalAt > 0.0 && now - lastHorizontalAt > resetAfter)) {
+            horizontalAccum = 0.0;
+            horizontalTriggered = false;
+        }
+        if (xoffset != 0.0) {
+            lastHorizontalAt = now;
+            horizontalAccum += xoffset;
+            double threshold = cfg.num("gestures.horizontalSlideThreshold", 4.0f);
+            if (!horizontalTriggered && std::abs(horizontalAccum) >= threshold) {
+                int next = g_gal.ui.fullScreenIndex + (horizontalAccum < 0.0 ? 1 : -1);
+                if (next >= 0 && next < (int)g_gal.currentRecords.size()) {
+                    g_gal.ui.openFullScreen(next, g_gal.currentRecords, g_gal.timeline);
+                    horizontalTriggered = true;
+                }
+            }
+        }
+
+        double roundedY = std::round(yoffset);
+        double wheelTolerance = cfg.num("gestures.wheelDiscreteTolerance", 0.08f);
+        bool discreteWheel = yoffset != 0.0 &&
+                             std::abs(yoffset - roundedY) <= wheelTolerance;
+        if (discreteWheel) {
+            float oldZoom = g_gal.ui.fsZoom;
+            float step = cfg.num("fullscreen.zoomStep", 0.15f);
+            float newZoom = std::clamp(oldZoom * std::pow(1.0f + step, (float)yoffset),
+                                       cfg.num("fullscreen.minZoom", 0.2f),
+                                       cfg.num("fullscreen.maxZoom", 10.0f));
+            float centerX = (float)g_gal.windowW * 0.5f;
+            float centerY = g_gal.ui.L.fsTopBarH +
+                            ((float)g_gal.windowH - g_gal.ui.L.fsTopBarH) * 0.5f;
+            float ratio = oldZoom > 0.0f ? newZoom / oldZoom : 1.0f;
+            g_gal.ui.fsPanX = (float)g_gal.mouseX - centerX -
+                ((float)g_gal.mouseX - centerX - g_gal.ui.fsPanX) * ratio;
+            g_gal.ui.fsPanY = (float)g_gal.mouseY - centerY -
+                ((float)g_gal.mouseY - centerY - g_gal.ui.fsPanY) * ratio;
+            g_gal.ui.fsZoom = newZoom;
+        } else if (yoffset != 0.0 && g_gal.ui.fsZoom > 1.01f) {
+            float panSpeed = cfg.num("gestures.panPixelsPerUnit", 32.0f);
+            g_gal.ui.fsPanY += (float)yoffset * panSpeed;
+        }
         return;
     }
 
@@ -355,6 +420,52 @@ static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
     }
 
     g_gal.ui.handleScroll((float)yoffset, g_gal.timeline.totalContentHeight, (float)g_gal.windowH);
+}
+
+static float g_pinchStartZoom = 1.0f;
+static float g_pinchStartFullscreenZoom = 1.0f;
+static float g_pendingPinchZoom = 1.0f;
+static bool g_hasPendingPinchZoom = false;
+
+static void pinchCallback(GLFWwindow*, int phase, double scale,
+                          double centerX, double centerY, int fingers) {
+    (void)centerX;
+    (void)centerY;
+    if (fingers < 2) return;
+    g_gal.redrawPending = true;
+
+    if (phase == GLFW_PINCH_BEGIN) {
+        g_pinchStartZoom = g_gal.timeline.zoomScale;
+        g_pinchStartFullscreenZoom = g_gal.ui.fsZoom;
+        return;
+    }
+    if (phase != GLFW_PINCH_UPDATE || scale <= 0.0) return;
+
+    if (g_gal.ui.isFullScreenView) {
+        const SilverConfig& cfg = SilverConfig::get();
+        float oldZoom = g_gal.ui.fsZoom;
+        float newZoom = std::clamp(g_pinchStartFullscreenZoom * (float)scale,
+                                   cfg.num("fullscreen.minZoom", 0.2f),
+                                   cfg.num("fullscreen.maxZoom", 10.0f));
+        if (oldZoom > 0.0f) {
+            float ratio = newZoom / oldZoom;
+            float viewCenterX = (float)g_gal.windowW * 0.5f;
+            float viewCenterY = (float)g_gal.windowH * 0.5f;
+            g_gal.ui.fsPanX = (float)centerX - viewCenterX -
+                              ((float)centerX - viewCenterX - g_gal.ui.fsPanX) * ratio;
+            g_gal.ui.fsPanY = (float)centerY - viewCenterY -
+                              ((float)centerY - viewCenterY - g_gal.ui.fsPanY) * ratio;
+        }
+        g_gal.ui.fsZoom = newZoom;
+        return;
+    }
+
+    // Timeline zoom is normalized. Multiplication barely moves at Small/Year
+    // (for example 6% * 2 = 12%), while logarithmic travel stays consistent.
+    // Coalesce native updates so timeline relayout happens once per frame.
+    float response = SilverConfig::get().num("zoom.pinchResponse", 0.42f);
+    g_pendingPinchZoom = g_pinchStartZoom + std::log((float)scale) * response;
+    g_hasPendingPinchZoom = true;
 }
 
 // Text entry for the settings search box.
@@ -714,6 +825,8 @@ int main(int argc, char* argv[]) {
         glfwTerminate();
         return 1;
     }
+    if (g_gal.showRenderStats)
+        glGenQueries(2, g_gal.gpuTimerQueries);
 
     glfwGetFramebufferSize(g_gal.window, &g_gal.fbW, &g_gal.fbH);
     glViewport(0, 0, g_gal.fbW, g_gal.fbH);
@@ -724,6 +837,7 @@ int main(int argc, char* argv[]) {
     glfwSetCursorPosCallback(g_gal.window, cursorPosCallback);
     glfwSetMouseButtonCallback(g_gal.window, mouseButtonCallback);
     glfwSetScrollCallback(g_gal.window, scrollCallback);
+    glfwSetPinchCallback(g_gal.window, pinchCallback);
     glfwSetKeyCallback(g_gal.window, keyCallback);
     glfwSetCharCallback(g_gal.window, charCallback);
 
@@ -858,6 +972,32 @@ int main(int argc, char* argv[]) {
         lastTime = now;
         dt = std::min(dt, 0.1f);
 
+        if (g_pendingWindowRelayout) {
+            g_pendingWindowRelayout = false;
+            float gridW = g_gal.ui.gridWidth((float)g_gal.windowW);
+            bool hasBanner = (!g_gal.ui.activeFolderFilter.empty() &&
+                              g_gal.ui.currentTab != TAB_FOLDERS);
+            // Live resize follows the window immediately. Deliberate zoom and
+            // grouping changes retain their interruptible position springs.
+            g_gal.ui.relayoutKeepingAnchor(g_gal.timeline, gridW, hasBanner,
+                                           (float)g_gal.windowH,
+                                           g_gal.ui.selectedPath,
+                                           /*snapAll=*/true);
+        }
+
+        if (g_hasPendingPinchZoom) {
+            g_hasPendingPinchZoom = false;
+            float gridW = g_gal.ui.gridWidth((float)g_gal.windowW);
+            bool hasBanner = (!g_gal.ui.activeFolderFilter.empty() &&
+                              g_gal.ui.currentTab != TAB_FOLDERS);
+            g_gal.ui.withViewAnchor(g_gal.timeline, (float)g_gal.windowH, [&] {
+                g_gal.timeline.setZoomScale(g_pendingPinchZoom, gridW,
+                                            g_gal.currentRecords, hasBanner);
+            });
+            g_gal.ui.showZoomPopup = true;
+            g_gal.ui.zoomPopupAutoCloseTimer = g_gal.ui.L.zoomAutoCloseSeconds;
+        }
+
         // Fold in freshly indexed photos while a scan is still running, but at
         // most a couple of times a second so the grid never stutters.
         if (g_gal.scanner.hasFreshData.load()) {
@@ -913,6 +1053,23 @@ int main(int argc, char* argv[]) {
         }
         g_gal.timeline.updateVisibility(g_gal.ui.scrollY, (float)g_gal.windowH, (float)g_gal.mouseX, (float)g_gal.mouseY, dt);
 
+        if (g_gal.showRenderStats) {
+            int query = g_gal.gpuTimerIndex;
+            if (g_gal.gpuTimerIssued[query]) {
+                GLint available = GL_FALSE;
+                glGetQueryObjectiv(g_gal.gpuTimerQueries[query],
+                                   GL_QUERY_RESULT_AVAILABLE, &available);
+                if (available) {
+                    GLuint64 ns = 0;
+                    glGetQueryObjectui64v(g_gal.gpuTimerQueries[query],
+                                          GL_QUERY_RESULT, &ns);
+                    g_gal.gpuFrameMs = (double)ns / 1000000.0;
+                }
+            }
+            glBeginQuery(GL_TIME_ELAPSED,
+                         g_gal.gpuTimerQueries[g_gal.gpuTimerIndex]);
+        }
+
         // 1. Draw Background Canvas
         g_gal.bgShader.drawBackground(g_gal.windowW, g_gal.windowH, 0, g_gal.ui.theme.isDarkMode.load());
 
@@ -924,6 +1081,11 @@ int main(int argc, char* argv[]) {
                         g_gal.timeline, g_gal.db, g_gal.scanner, g_gal.font, g_gal.iconAtlas,
                         g_gal.currentRecords);
         g_gal.font.endFrame();
+        if (g_gal.showRenderStats) {
+            glEndQuery(GL_TIME_ELAPSED);
+            g_gal.gpuTimerIssued[g_gal.gpuTimerIndex] = true;
+            g_gal.gpuTimerIndex = 1 - g_gal.gpuTimerIndex;
+        }
 
         if (g_gal.showThumbStats) {
             static float thumbStatTimer = 0.0f;
@@ -941,7 +1103,9 @@ int main(int argc, char* argv[]) {
                 statTimer = 1.0f;
                 std::cout << "[SilverGallery] draw calls " << g_gal.font.drawCallsLastFrame
                           << " from " << g_gal.font.batchesLastFrame << " batches, "
-                          << g_gal.font.verticesLastFrame << " verts" << std::endl;
+                          << g_gal.font.verticesLastFrame << " verts, CPU "
+                          << dt * 1000.0f << " ms, GPU " << g_gal.gpuFrameMs
+                          << " ms" << std::endl;
             }
         }
 
@@ -961,6 +1125,7 @@ int main(int argc, char* argv[]) {
 
     g_gal.scanner.stop();
     g_gal.db.close();
+    if (g_gal.gpuTimerQueries[0]) glDeleteQueries(2, g_gal.gpuTimerQueries);
     glfwDestroyWindow(g_gal.window);
     glfwTerminate();
     return 0;

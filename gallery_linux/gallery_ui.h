@@ -517,7 +517,7 @@ public:
         if (moving(shortcutsAnim, showShortcuts ? 1.0f : 0.0f)) return true;
         if (moving(settingsAnim, showSettings ? 1.0f : 0.0f)) return true;
         if (themeToastTimer > 0.0f || zoomPopupAutoCloseTimer > 0.0f) return true;
-        if (thumbs.hasPendingWork()) return true;        // decodes still arriving
+        if (thumbs.hasReadyUploads()) return true;       // drain bounded GPU uploads
         if (timeline.hasActiveMotion()) return true;
         return false;
     }
@@ -630,6 +630,7 @@ public:
     GalleryUI() {
         applyConfig();
         theme.init();
+        thumbs.setAtlasEnabled(true);
         thumbs.init();
         fullResLoader.init();
     }
@@ -808,8 +809,12 @@ public:
     template <typename Fn>
     void withViewAnchor(TimelineManager& timeline, float windowH, Fn&& fn) {
         ViewAnchor a = captureViewAnchor(timeline, windowH);
+        TimelineGrouping oldGrouping = timeline.grouping;
+        float oldScrollY = scrollY;
         fn();
         restoreViewAnchor(timeline, a, windowH);
+        if (timeline.grouping != oldGrouping)
+            timeline.beginVisibleRegroupAnimation(oldScrollY, scrollY, windowH);
     }
 
     // Re-lay out the grid while keeping `anchorPath` visually pinned.
@@ -818,7 +823,8 @@ public:
     // moves every tile. Without an anchor the photo you just clicked can end up
     // far off screen - you select an image and it vanishes from the grid.
     void relayoutKeepingAnchor(TimelineManager& timeline, float gridW, bool hasBanner,
-                               float windowH, const std::string& anchorPath) {
+                               float windowH, const std::string& anchorPath,
+                               bool snapAll = false) {
         float anchorScreenY = 0.0f;
         bool haveAnchor = false;
 
@@ -829,7 +835,7 @@ public:
             }
         }
 
-        timeline.relayout(gridW, hasBanner);
+        timeline.relayout(gridW, hasBanner, snapAll);
 
         if (haveAnchor) {
             if (const TimelineItem* after = timeline.findItem(anchorPath)) {
@@ -837,7 +843,8 @@ public:
                 // so a glide here reads as the grid drifting on its own.
                 float maxScroll = std::max(0.0f, timeline.totalContentHeight - windowH);
                 float wanted = std::clamp(after->y - anchorScreenY, 0.0f, maxScroll);
-                timeline.shiftAnimatedPositions(wanted - scrollY);
+                if (!snapAll)
+                    timeline.shiftAnimatedPositions(wanted - scrollY);
                 targetScrollY = wanted;
                 scrollY = targetScrollY;
                 scrollVel = 0.0f;
@@ -846,6 +853,15 @@ public:
                 // If pinning still leaves it clipped, pull it fully into view.
                 ensureItemVisible(after->y, after->h, timeline.totalContentHeight, windowH);
             }
+        } else {
+            // Resizing can drastically reduce total height. Never retain a
+            // scroll offset beyond the new document, which otherwise exposes
+            // an empty or partially populated frame during fast maximize.
+            float maxScroll = std::max(0.0f, timeline.totalContentHeight - windowH);
+            scrollY = std::clamp(scrollY, 0.0f, maxScroll);
+            targetScrollY = scrollY;
+            scrollVel = 0.0f;
+            scrollPrevTarget = scrollY;
         }
     }
 
@@ -1630,6 +1646,17 @@ public:
                             v0 = crop;
                             v1 = 1.0f - crop;
                         }
+                    }
+
+                    if (it->second.atlasSlot >= 0) {
+                        float au0 = it->second.atlasU0;
+                        float av0 = it->second.atlasV0;
+                        float du = it->second.atlasU1 - au0;
+                        float dv = it->second.atlasV1 - av0;
+                        u0 = au0 + u0 * du;
+                        u1 = au0 + u1 * du;
+                        v0 = av0 + v0 * dv;
+                        v1 = av0 + v1 * dv;
                     }
 
                     UIVertex v[6] = {
@@ -3193,6 +3220,15 @@ public:
             }
         }
 
+        // A fast navigation can beat both GPU thumbnail upload and the full-res
+        // decoder. The database preview is always safe to show for the selected
+        // record and avoids a blank canvas containing only navigation arrows.
+        if (!drawTexId && selectedRecord.hasPreview) {
+            drawTexId = previewTextureFor(selectedRecord);
+            if (imgW <= 0) imgW = GalleryRecord::kPreviewDim;
+            if (imgH <= 0) imgH = GalleryRecord::kPreviewDim;
+        }
+
         if (drawTexId && imgW > 0 && imgH > 0) {
             float aspect = (float)imgW / (float)imgH;
             float targetW = innerW - 12.0f;
@@ -3480,6 +3516,12 @@ public:
                 if (imgW <= 0) imgW = it->second.width;
                 if (imgH <= 0) imgH = it->second.height;
             }
+        }
+
+        if (!drawTexId && selectedRecord.hasPreview) {
+            drawTexId = previewTextureFor(selectedRecord);
+            if (imgW <= 0) imgW = GalleryRecord::kPreviewDim;
+            if (imgH <= 0) imgH = GalleryRecord::kPreviewDim;
         }
 
         float topBarH = L.fsTopBarH;

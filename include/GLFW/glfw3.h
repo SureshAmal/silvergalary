@@ -1875,6 +1875,17 @@ typedef void (* GLFWcursorenterfun)(GLFWwindow* window, int entered);
  */
 typedef void (* GLFWscrollfun)(GLFWwindow* window, double xoffset, double yoffset);
 
+#define GLFW_PINCH_BEGIN   0
+#define GLFW_PINCH_UPDATE  1
+#define GLFW_PINCH_END     2
+#define GLFW_PINCH_CANCEL  3
+
+/*! @brief Native pinch callback type (Silver extension).
+ *  Scale is relative to gesture begin; center uses window content coordinates.
+ */
+typedef void (* GLFWpinchfun)(GLFWwindow* window, int phase, double scale,
+                              double center_x, double center_y, int fingers);
+
 /*! @brief The function pointer type for keyboard key callbacks.
  *
  *  This is the function pointer type for keyboard key callbacks.  A keyboard
@@ -5442,6 +5453,9 @@ GLFWAPI GLFWcursorenterfun glfwSetCursorEnterCallback(GLFWwindow* window, GLFWcu
  */
 GLFWAPI GLFWscrollfun glfwSetScrollCallback(GLFWwindow* window, GLFWscrollfun callback);
 
+/*! @brief Sets the native pinch callback (Silver extension). */
+GLFWAPI GLFWpinchfun glfwSetPinchCallback(GLFWwindow* window, GLFWpinchfun callback);
+
 /*! @brief Sets the path drop callback.
  *
  *  This function sets the path drop callback of the specified window, which is
@@ -6574,4 +6588,3 @@ GLFWAPI VkResult glfwCreateWindowSurface(VkInstance instance, GLFWwindow* window
 #endif
 
 #endif /* _glfw3_h_ */
-

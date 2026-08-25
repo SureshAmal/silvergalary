@@ -13,6 +13,7 @@
 #include "silver_config.h"
 #include "silver_anim.h"
 #include "silver_settings.h"
+#include "silver_constants.h"
 #include <vector>
 #include <string>
 #include <cmath>
@@ -52,6 +53,7 @@ struct GalleryUIAction {
     std::string targetPath;
     std::string folderFilter;
     int tabIndex = 0;
+    int starred = -1;              // explicit post-toggle state for cache sync
 };
 
 // Every pixel metric the gallery chrome uses, sourced from config/silver.json.
@@ -89,7 +91,7 @@ struct GalleryLayout {
     // sidebar
     float sbPreviewH = 190.0f;
     float sbPreviewRadius = 8.0f;
-    float sbButtonH = 34.0f;
+    float sbButtonH = 40.0f;
     float sbButtonRadius = 6.0f;
     float sbMetaRowH = 24.0f;
     float sbPathLineH = 20.0f;
@@ -101,7 +103,7 @@ struct GalleryLayout {
     float fsTopBarH = 64.0f;
     float fsImageMargin = 40.0f;
     float fsArrowSize = 48.0f;
-    float fsButtonSize = 36.0f;
+    float fsButtonSize = 40.0f;
 
     // scrollbar / scrubber
     float scrubW = 16.0f;
@@ -155,7 +157,7 @@ struct GalleryLayout {
 
         sbPreviewH        = c.num("sidebar.previewHeight", 190.0f);
         sbPreviewRadius   = c.num("sidebar.previewRadius", 8.0f);
-        sbButtonH         = c.num("sidebar.buttonHeight", 34.0f);
+        sbButtonH         = std::max(40.0f, c.num("sidebar.buttonHeight", 40.0f));
         sbButtonRadius    = c.num("sidebar.buttonRadius", 6.0f);
         sbMetaRowH        = c.num("sidebar.metaRowHeight", 24.0f);
         sbPathLineH       = c.num("sidebar.pathLineHeight", 20.0f);
@@ -166,7 +168,7 @@ struct GalleryLayout {
         fsTopBarH         = c.num("fullscreen.topBarHeight", 64.0f);
         fsImageMargin     = c.num("fullscreen.imageMargin", 40.0f);
         fsArrowSize       = c.num("fullscreen.arrowSize", 48.0f);
-        fsButtonSize      = c.num("fullscreen.buttonSize", 36.0f);
+        fsButtonSize      = std::max(40.0f, c.num("fullscreen.buttonSize", 40.0f));
 
         scrubW            = c.num("scrollbar.width", 16.0f);
         scrubHandleH      = c.num("scrollbar.handleHeight", 30.0f);
@@ -515,7 +517,7 @@ public:
         if (moving(shortcutsAnim, showShortcuts ? 1.0f : 0.0f)) return true;
         if (moving(settingsAnim, showSettings ? 1.0f : 0.0f)) return true;
         if (themeToastTimer > 0.0f || zoomPopupAutoCloseTimer > 0.0f) return true;
-        if (thumbs.hasPendingWork()) return true;        // decodes still arriving
+        if (thumbs.hasReadyUploads()) return true;       // drain bounded GPU uploads
         if (timeline.hasActiveMotion()) return true;
         return false;
     }
@@ -528,6 +530,14 @@ public:
     // this.
     static Color4 fade(const Color4& c, float a) {
         return Color4(c.r, c.g, c.b, c.a * a);
+    }
+
+    // Neutral inset image edge: pure white in dark mode and pure black in
+    // light mode. A themed/tinted edge picks up the surrounding surface and
+    // makes pale photographs look dirty.
+    static Color4 imageOutline(const ThemePalette& pal, float alpha = 1.0f) {
+        return pal.isDark ? Color4(1, 1, 1, 0.10f * alpha)
+                          : Color4(0, 0, 0, 0.10f * alpha);
     }
 
     static std::string fitTextWithEllipsis(FontRenderer& font, const std::string& text, float maxW) {
@@ -613,12 +623,14 @@ public:
         settingsCtrlW   = 200.0f * k;
         silveranim::reloadFromConfig();
         thumbs.applyConfig();
-        fullResLoader.maxDecodeEdge = SilverConfig::get().integer("thumbnails.previewMaxEdge", 4096);
+        fullResLoader.maxDecodeEdge = SilverConfig::get().integer(
+            "thumbnails.previewMaxEdge", silver::defaults::fullResolutionDecode);
     }
 
     GalleryUI() {
         applyConfig();
         theme.init();
+        thumbs.setAtlasEnabled(true);
         thumbs.init();
         fullResLoader.init();
     }
@@ -797,8 +809,12 @@ public:
     template <typename Fn>
     void withViewAnchor(TimelineManager& timeline, float windowH, Fn&& fn) {
         ViewAnchor a = captureViewAnchor(timeline, windowH);
+        TimelineGrouping oldGrouping = timeline.grouping;
+        float oldScrollY = scrollY;
         fn();
         restoreViewAnchor(timeline, a, windowH);
+        if (timeline.grouping != oldGrouping)
+            timeline.beginVisibleRegroupAnimation(oldScrollY, scrollY, windowH);
     }
 
     // Re-lay out the grid while keeping `anchorPath` visually pinned.
@@ -807,7 +823,8 @@ public:
     // moves every tile. Without an anchor the photo you just clicked can end up
     // far off screen - you select an image and it vanishes from the grid.
     void relayoutKeepingAnchor(TimelineManager& timeline, float gridW, bool hasBanner,
-                               float windowH, const std::string& anchorPath) {
+                               float windowH, const std::string& anchorPath,
+                               bool snapAll = false) {
         float anchorScreenY = 0.0f;
         bool haveAnchor = false;
 
@@ -818,7 +835,7 @@ public:
             }
         }
 
-        timeline.relayout(gridW, hasBanner);
+        timeline.relayout(gridW, hasBanner, snapAll);
 
         if (haveAnchor) {
             if (const TimelineItem* after = timeline.findItem(anchorPath)) {
@@ -826,7 +843,8 @@ public:
                 // so a glide here reads as the grid drifting on its own.
                 float maxScroll = std::max(0.0f, timeline.totalContentHeight - windowH);
                 float wanted = std::clamp(after->y - anchorScreenY, 0.0f, maxScroll);
-                timeline.shiftAnimatedPositions(wanted - scrollY);
+                if (!snapAll)
+                    timeline.shiftAnimatedPositions(wanted - scrollY);
                 targetScrollY = wanted;
                 scrollY = targetScrollY;
                 scrollVel = 0.0f;
@@ -835,6 +853,15 @@ public:
                 // If pinning still leaves it clipped, pull it fully into view.
                 ensureItemVisible(after->y, after->h, timeline.totalContentHeight, windowH);
             }
+        } else {
+            // Resizing can drastically reduce total height. Never retain a
+            // scroll offset beyond the new document, which otherwise exposes
+            // an empty or partially populated frame during fast maximize.
+            float maxScroll = std::max(0.0f, timeline.totalContentHeight - windowH);
+            scrollY = std::clamp(scrollY, 0.0f, maxScroll);
+            targetScrollY = scrollY;
+            scrollVel = 0.0f;
+            scrollPrevTarget = scrollY;
         }
     }
 
@@ -852,13 +879,16 @@ public:
         }
 
         wanted = std::clamp(wanted, 0.0f, maxScroll);
-        if (wanted != targetScrollY) {
+        if (std::abs(wanted - targetScrollY) > 0.5f) {
             targetScrollY = wanted;
             scrollY = wanted;
             scrollVel = 0.0f;
             scrollPrevTarget = wanted;
+            // Emphasize only when keyboard navigation actually scrolls the
+            // viewport. Merely moving selection inside the visible area must
+            // not flash the scrollbar on every key press.
+            scrollbarAlpha = 1.0f;
         }
-        scrollbarAlpha = 1.0f;
     }
 
     void selectPhoto(const GalleryRecord& rec, TimelineManager& timeline, float windowH = 0.0f) {
@@ -887,6 +917,17 @@ public:
         timeline.selectItem(selectedPath);
         thumbs.requestThumbnail(selectedPath, true);
         fullResLoader.requestPrimaryImage(selectedPath);
+
+        std::vector<std::string> nearby;
+        nearby.reserve(7);
+        nearby.push_back(selectedPath);
+        for (int distance = 1; distance <= 3; ++distance) {
+            if (index + distance < (int)records.size())
+                nearby.push_back(records[(size_t)(index + distance)].path);
+            if (index - distance >= 0)
+                nearby.push_back(records[(size_t)(index - distance)].path);
+        }
+        fullResLoader.updatePreloadPaths(nearby);
     }
 
     GalleryUIAction handleMouseDown(float mx, float my, TimelineManager& timeline,
@@ -1036,6 +1077,8 @@ public:
                 if (isInside(mx, my, sbFavBtnRect.x, sbFavBtnRect.y, sbFavBtnRect.w, sbFavBtnRect.h)) {
                     act.type = GalleryUIAction::TOGGLE_STAR;
                     act.targetPath = selectedPath;
+                    selectedRecord.starred = 1 - selectedRecord.starred;
+                    act.starred = selectedRecord.starred;
                     return act;
                 }
                 // Standalone Viewer Button
@@ -1137,6 +1180,9 @@ public:
             searchActive = true;
             return act;
         }
+        // Clicking elsewhere commits the current query and returns keyboard
+        // ownership to the gallery without clearing the filtered results.
+        if (searchActive) searchActive = false;
 
         // -------------------------------------------------------------
         // 3. TOP BAR TAB & BUTTON CLICKS
@@ -1266,6 +1312,11 @@ public:
             if (isInside(mx, my, starX, starY, starSize, starSize)) {
                 act.type = GalleryUIAction::TOGGLE_STAR;
                 act.targetPath = itm->record.path;
+                itm->record.starred = 1 - itm->record.starred;
+                act.starred = itm->record.starred;
+                if (selectedPath == itm->record.path) {
+                    selectedRecord.starred = itm->record.starred;
+                }
                 return act;
             } else {
                 auto now = std::chrono::steady_clock::now();
@@ -1614,6 +1665,17 @@ public:
                         }
                     }
 
+                    if (it->second.atlasSlot >= 0) {
+                        float au0 = it->second.atlasU0;
+                        float av0 = it->second.atlasV0;
+                        float du = it->second.atlasU1 - au0;
+                        float dv = it->second.atlasV1 - av0;
+                        u0 = au0 + u0 * du;
+                        u1 = au0 + u1 * du;
+                        v0 = av0 + v0 * dv;
+                        v1 = av0 + v1 * dv;
+                    }
+
                     UIVertex v[6] = {
                         { ix, iy, u0, v0, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
                         { ix + iw, iy, u1, v0, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
@@ -1625,6 +1687,12 @@ public:
                     };
                     font.vertices.insert(font.vertices.end(), v, v + 6);
                     font.render(windowW, windowH, it->second.texId);
+
+                    font.beginBatch();
+                    font.addRoundedBorder(ix, iy, iw, ih,
+                                          std::max(0.0f, L.tileRadius - pad),
+                                          1.0f, imageOutline(pal));
+                    font.render(windowW, windowH);
                 } else if (GLuint prev = previewTextureFor(itm->record)) {
                     // Blurred 8x8 impression of the photo, upscaled. The grid
                     // paints something recognisable the instant it opens rather
@@ -2167,19 +2235,36 @@ public:
                 // quarter-width chip clipped "Month" and pushed its label out of
                 // the pill once real font metrics replaced the ASCII bake.
                 static const char* kGroupLabels[4] = { "Day", "Week", "Month", "Year" };
-                const float chipGap = 5.0f;
-                const float chipPadX = 9.0f;
-                const float chipH = 26.0f;
+                const float popupPad = 10.0f * L.uiScale;
+                const float headerH = std::max(38.0f * L.uiScale,
+                                               font.textHeight() + 16.0f * L.uiScale);
+                const float dividerGap = 7.0f * L.uiScale;
+                const float chipGap = 5.0f * L.uiScale;
+                const float chipPadX = 9.0f * L.uiScale;
+                const float chipH = std::max(26.0f * L.uiScale,
+                                             font.textHeight() + 10.0f * L.uiScale);
+                const float itemH = std::max(40.0f, std::max(32.0f * L.uiScale,
+                                             font.textHeight() + 14.0f * L.uiScale));
+                const float itemGap = 3.0f * L.uiScale;
+                const float listTop = popupPad + headerH + dividerGap;
+                const float footerPadY = 9.0f * L.uiScale;
                 float chipLabelW[4];
                 float chipsNatural = 0.0f;
                 for (int gi = 0; gi < 4; ++gi) {
                     chipLabelW[gi] = font.measureText(kGroupLabels[gi]);
                     chipsNatural += chipLabelW[gi] + chipPadX * 2.0f;
                 }
-                float chipsNeeded = chipsNatural + chipGap * 3.0f + 16.0f;
+                float chipsNeeded = chipsNatural + chipGap * 3.0f + popupPad * 2.0f;
+
+                // Height must follow its contents. Previously only the card
+                // height scaled with a small font while these rows stayed at
+                // fixed pixel sizes, so Small and the grouping chips collided.
+                float listH = itemH * 4.0f + itemGap * 3.0f;
+                float contentNeededH = listTop + listH + dividerGap +
+                                       footerPadY * 2.0f + chipH;
 
                 float popW = std::max(L.zoomPopupW, chipsNeeded);
-                float popH = L.zoomPopupH;
+                float popH = std::max(L.zoomPopupH, contentNeededH);
                 float popX = std::max(16.0f, pillX + pillW - popW);
                 float popTargetY = pillY - popH - 10.0f;
 
@@ -2208,6 +2293,33 @@ public:
                 font.addRoundedBorder(popX, popY, popW, popH, 10.0f, 1.2f, pal.isDark ? Color4::Hex(0x2D323E, popupAlpha) : Color4::Hex(0xE0E3E8, popupAlpha));
                 font.render(windowW, windowH);
 
+                // FilePilot-style compact title bar: the component explains
+                // itself and keeps the live zoom value visible while dragging.
+                const float headerY = popY + popupPad;
+                const float headerIcon = 17.0f * L.uiScale;
+                font.beginBatch();
+                iconAtlas.drawIcon(font, ICON_GRID, popX + popupPad,
+                                   headerY + (headerH - headerIcon) * 0.5f,
+                                   headerIcon, headerIcon,
+                                   fade(pal.textSecondary, popupAlpha));
+                font.render(windowW, windowH, 0, iconAtlas.textureId);
+
+                char zoomValue[16];
+                snprintf(zoomValue, sizeof(zoomValue), "%d%%", timeline.getZoomPercentage());
+                font.beginBatch();
+                font.addTextVCentered(popX + popupPad + 27.0f * L.uiScale,
+                                      headerY, headerH, "View size",
+                                      fade(pal.textPrimary, popupAlpha));
+                font.addTextVCentered(popX + popW - popupPad - font.measureText(zoomValue),
+                                      headerY, headerH, zoomValue,
+                                      fade(pal.textSecondary, popupAlpha));
+                const float dividerY = popY + popupPad + headerH;
+                font.addRect(popX + popupPad, dividerY,
+                             popW - popupPad * 2.0f, std::max(1.0f, L.uiScale),
+                             pal.isDark ? Color4::Hex(0x303540, 0.75f * popupAlpha)
+                                        : Color4::Hex(0xE4E7EC, 0.90f * popupAlpha));
+                font.render(windowW, windowH);
+
                 // Preset List (Left column)
                 struct PresetInfo {
                     GridPreset preset;
@@ -2217,16 +2329,15 @@ public:
                 };
                 PresetInfo presets[4] = {
                     { PRESET_XL, ICON_PHOTO, "Extra Large", &presetXLRect },
-                    { PRESET_LARGE, ICON_GRID, "Large", &presetLargeRect },
+                    { PRESET_LARGE, ICON_GRID_2X2, "Large", &presetLargeRect },
                     { PRESET_MEDIUM, ICON_GRID, "Medium", &presetMediumRect },
-                    { PRESET_SMALL, ICON_GRID, "Small", &presetSmallRect }
+                    { PRESET_SMALL, ICON_GRID_4X4, "Small", &presetSmallRect }
                 };
 
-                float itemX = popX + 8.0f;
-                float itemW = popW - 38.0f; // 142px
-                float itemH = 32.0f;
-                float itemGap = 3.0f;
-                float curItemY = popY + 14.0f;
+                const float sliderLaneW = 25.0f * L.uiScale;
+                float itemX = popX + popupPad;
+                float itemW = popW - popupPad * 2.0f - sliderLaneW;
+                float curItemY = popY + listTop;
 
                 for (int pIdx = 0; pIdx < 4; ++pIdx) {
                     PresetInfo& pi = presets[pIdx];
@@ -2255,33 +2366,37 @@ public:
                     Color4 iconCol = isActive ? Color4(1, 1, 1, popupAlpha)
                                               : fade(pi.rect->isHovered ? pal.textPrimary : pal.textSecondary, popupAlpha);
                     font.beginBatch();
-                    iconAtlas.drawIcon(font, pi.icon, itemX + 8.0f, curItemY + 7.0f, 18.0f, 18.0f, iconCol);
+                    float presetIcon = 18.0f * L.uiScale;
+                    iconAtlas.drawIcon(font, pi.icon, itemX + 8.0f * L.uiScale,
+                                       curItemY + (itemH - presetIcon) * 0.5f,
+                                       presetIcon, presetIcon, iconCol);
                     font.render(windowW, windowH, 0, iconAtlas.textureId);
 
                     // Text
                     Color4 textCol = isActive ? Color4(1, 1, 1, popupAlpha)
                                               : fade(pal.textPrimary, popupAlpha);
                     font.beginBatch();
-                    font.addTextVCentered(itemX + 32.0f, curItemY, itemH, pi.label, textCol);
+                    font.addTextVCentered(itemX + 32.0f * L.uiScale, curItemY, itemH, pi.label, textCol);
                     font.render(windowW, windowH);
 
                     curItemY += itemH + itemGap;
                 }
 
                 // Vertical Slider (Right column)
-                float trackX = popX + popW - 18.0f;
-                float trackY = popY + 14.0f;
-                float trackW = 6.0f;
-                float trackH = popH - 28.0f - 46.0f; // leaves room for the granularity chips
+                float laneX = popX + popW - popupPad - sliderLaneW + 5.0f * L.uiScale;
+                float trackX = laneX + (sliderLaneW - 10.0f * L.uiScale) * 0.5f;
+                float trackY = popY + listTop;
+                float trackW = 6.0f * L.uiScale;
+                float trackH = listH;
 
-                zoomSliderTrackRect.x = trackX - 8.0f;
+                zoomSliderTrackRect.x = trackX - 8.0f * L.uiScale;
                 zoomSliderTrackRect.y = trackY;
-                zoomSliderTrackRect.w = 22.0f;
+                zoomSliderTrackRect.w = 22.0f * L.uiScale;
                 zoomSliderTrackRect.h = trackH;
 
                 float thumbY = trackY + (1.0f - timeline.zoomScale) * trackH;
-                float thumbW = 12.0f;
-                float thumbH = 22.0f;
+                float thumbW = 12.0f * L.uiScale;
+                float thumbH = 22.0f * L.uiScale;
                 float thumbX = trackX + (trackW - thumbW) * 0.5f;
 
                 zoomSliderThumbRect.x = thumbX;
@@ -2290,6 +2405,12 @@ public:
                 zoomSliderThumbRect.h = thumbH;
 
                 font.beginBatch();
+                // A dedicated inset lane prevents the handle from looking as
+                // if it floats over the menu commands.
+                font.addRoundedRect(laneX, trackY, sliderLaneW,
+                                    trackH, 7.0f * L.uiScale,
+                                    pal.isDark ? Color4::Hex(0x14171D, 0.62f * popupAlpha)
+                                               : Color4::Hex(0xF2F4F7, 0.90f * popupAlpha));
                 // Rail background
                 Color4 railBg = pal.isDark ? Color4::Hex(0x2A2E38, popupAlpha) : Color4::Hex(0xDFE2E8, popupAlpha);
                 font.addRoundedRect(trackX, trackY, trackW, trackH, 3.0f, railBg);
@@ -2307,14 +2428,22 @@ public:
 
                 // Timeline granularity chips - the same Day / Week / Month / Year
                 // steps a pinch gesture walks through on a phone gallery.
-                float chipY = popY + popH - chipH - 10.0f;
+                float chipY = popY + popH - chipH - footerPadY;
+
+                // Visually separate grouping (layout) from sizing (zoom).
+                font.beginBatch();
+                font.addRect(popX + popupPad, chipY - footerPadY,
+                             popW - popupPad * 2.0f, std::max(1.0f, L.uiScale),
+                             pal.isDark ? Color4::Hex(0x303540, 0.75f * popupAlpha)
+                                        : Color4::Hex(0xE4E7EC, 0.90f * popupAlpha));
+                font.render(windowW, windowH);
 
                 // Give every chip its natural width, then share any slack evenly
                 // so the row still fills the popup.
-                float chipsAvail = popW - 16.0f - chipGap * 3.0f;
+                float chipsAvail = popW - popupPad * 2.0f - chipGap * 3.0f;
                 float chipExtra = std::max(0.0f, chipsAvail - chipsNatural) * 0.25f;
 
-                float chipX = popX + 8.0f;
+                float chipX = popX + popupPad;
                 for (int gi = 0; gi < 4; ++gi) {
                     float chipW = chipLabelW[gi] + chipPadX * 2.0f + chipExtra;
                     groupRects[gi].x = chipX;
@@ -3096,6 +3225,7 @@ public:
 
         // Draw High-Res / Thumbnail Preview
         GLuint drawTexId = highResPreview.id ? highResPreview.id : 0;
+        float drawU0 = 0.0f, drawV0 = 0.0f, drawU1 = 1.0f, drawV1 = 1.0f;
         int imgW = highResPreview.width > 0 ? highResPreview.width : selectedRecord.width;
         int imgH = highResPreview.height > 0 ? highResPreview.height : selectedRecord.height;
 
@@ -3103,9 +3233,22 @@ public:
             auto it = thumbs.cache.find(selectedPath);
             if (it != thumbs.cache.end() && it->second.ready) {
                 drawTexId = it->second.texId;
+                if (it->second.atlasSlot >= 0) {
+                    drawU0 = it->second.atlasU0; drawV0 = it->second.atlasV0;
+                    drawU1 = it->second.atlasU1; drawV1 = it->second.atlasV1;
+                }
                 if (imgW <= 0) imgW = it->second.width;
                 if (imgH <= 0) imgH = it->second.height;
             }
+        }
+
+        // A fast navigation can beat both GPU thumbnail upload and the full-res
+        // decoder. The database preview is always safe to show for the selected
+        // record and avoids a blank canvas containing only navigation arrows.
+        if (!drawTexId && selectedRecord.hasPreview) {
+            drawTexId = previewTextureFor(selectedRecord);
+            if (imgW <= 0) imgW = GalleryRecord::kPreviewDim;
+            if (imgH <= 0) imgH = GalleryRecord::kPreviewDim;
         }
 
         if (drawTexId && imgW > 0 && imgH > 0) {
@@ -3124,16 +3267,22 @@ public:
 
             font.beginBatch();
             UIVertex v[6] = {
-                { px, py, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
-                { px + finalW, py, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
-                { px + finalW, py + finalH, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px, py, drawU0, drawV0, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px + finalW, py, drawU1, drawV0, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px + finalW, py + finalH, drawU1, drawV1, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
 
-                { px, py, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
-                { px + finalW, py + finalH, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
-                { px, py + finalH, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px, py, drawU0, drawV0, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px + finalW, py + finalH, drawU1, drawV1, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
+                { px, py + finalH, drawU0, drawV1, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f },
             };
             font.vertices.insert(font.vertices.end(), v, v + 6);
             font.render(windowW, windowH, drawTexId);
+
+            font.beginBatch();
+            font.addRoundedBorder(px, py, finalW, finalH,
+                                  std::max(0.0f, L.sbPreviewRadius - 6.0f),
+                                  1.0f, imageOutline(pal));
+            font.render(windowW, windowH);
 
             // Hover overlay "Click to Fullscreen"
             if (sbPreviewRect.isHovered) {
@@ -3373,17 +3522,33 @@ public:
         font.render(windowW, windowH);
 
         // 2. Render Fullscreen Image (Smooth Zoom, Pan & Motion Spring Scale)
-        GLuint drawTexId = highResPreview.id;
-        int imgW = highResPreview.width > 0 ? highResPreview.width : selectedRecord.width;
-        int imgH = highResPreview.height > 0 ? highResPreview.height : selectedRecord.height;
+        // Never draw the previous full-resolution texture with the newly
+        // selected record's geometry.  That mismatch caused a very visible
+        // grow/shrink pulse while paging quickly.  Prefer the new thumbnail
+        // until its matching full-resolution image is ready.
+        bool highResMatches = highResPreview.id && highResPreview.meta.filePath == selectedPath;
+        GLuint drawTexId = highResMatches ? highResPreview.id : 0;
+        float drawU0 = 0.0f, drawV0 = 0.0f, drawU1 = 1.0f, drawV1 = 1.0f;
+        int imgW = highResMatches ? highResPreview.width : selectedRecord.width;
+        int imgH = highResMatches ? highResPreview.height : selectedRecord.height;
 
         if (!drawTexId) {
             auto it = thumbs.cache.find(selectedPath);
             if (it != thumbs.cache.end() && it->second.ready) {
                 drawTexId = it->second.texId;
+                if (it->second.atlasSlot >= 0) {
+                    drawU0 = it->second.atlasU0; drawV0 = it->second.atlasV0;
+                    drawU1 = it->second.atlasU1; drawV1 = it->second.atlasV1;
+                }
                 if (imgW <= 0) imgW = it->second.width;
                 if (imgH <= 0) imgH = it->second.height;
             }
+        }
+
+        if (!drawTexId && selectedRecord.hasPreview) {
+            drawTexId = previewTextureFor(selectedRecord);
+            if (imgW <= 0) imgW = GalleryRecord::kPreviewDim;
+            if (imgH <= 0) imgH = GalleryRecord::kPreviewDim;
         }
 
         float topBarH = L.fsTopBarH;
@@ -3409,18 +3574,35 @@ public:
             float ix = cx - scaleW * 0.5f;
             float iy = cy - scaleH * 0.5f;
 
+            // Keep the settled image bounds on physical pixels. This avoids a
+            // half-pixel softness at fractional desktop scales while the image
+            // texture itself continues to use smooth filtered sampling.
+            if (anim >= 0.999f && !isFsDragging) {
+                float right = font.snapToPixel(ix + scaleW);
+                float bottom = font.snapToPixel(iy + scaleH);
+                ix = font.snapToPixel(ix);
+                iy = font.snapToPixel(iy);
+                scaleW = right - ix;
+                scaleH = bottom - iy;
+            }
+
             font.beginBatch();
             UIVertex v[6] = {
-                { ix, iy, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix + scaleW, iy, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix + scaleW, iy + scaleH, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix, iy, drawU0, drawV0, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix + scaleW, iy, drawU1, drawV0, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix + scaleW, iy + scaleH, drawU1, drawV1, 1.0f, 1.0f, 1.0f, anim, 2.0f },
 
-                { ix, iy, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix + scaleW, iy + scaleH, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix, iy + scaleH, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix, iy, drawU0, drawV0, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix + scaleW, iy + scaleH, drawU1, drawV1, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix, iy + scaleH, drawU0, drawV1, 1.0f, 1.0f, 1.0f, anim, 2.0f },
             };
             font.vertices.insert(font.vertices.end(), v, v + 6);
             font.render(windowW, windowH, drawTexId);
+
+            font.beginBatch();
+            font.addBorder(ix, iy, scaleW, scaleH, 1.0f,
+                           imageOutline(pal, anim));
+            font.render(windowW, windowH);
         }
 
         // 3. Navigation Arrows (< and >)
@@ -3474,16 +3656,18 @@ public:
 
         font.beginBatch();
         font.addRoundedRect(fsBackBtnRect.x, fsBackBtnRect.y, fsBackBtnRect.w, fsBackBtnRect.h, 18.0f,
-                            fsBackBtnRect.isHovered ? pal.btnHover : pal.cardBg);
-        font.addRoundedBorder(fsBackBtnRect.x, fsBackBtnRect.y, fsBackBtnRect.w, fsBackBtnRect.h, 18.0f, 1.0f, pal.cardBorder);
+                            fade(fsBackBtnRect.isHovered ? pal.btnHover : pal.cardBg, anim));
+        font.addRoundedBorder(fsBackBtnRect.x, fsBackBtnRect.y, fsBackBtnRect.w, fsBackBtnRect.h, 18.0f, 1.0f,
+                              fade(pal.cardBorder, anim));
         font.render(windowW, windowH);
 
         font.beginBatch();
-        iconAtlas.drawIcon(font, ICON_ARROW_LEFT, fsBackBtnRect.x + 10.0f, fsBackBtnRect.y + 9.0f, 18.0f, 18.0f, pal.accent);
+        iconAtlas.drawIcon(font, ICON_ARROW_LEFT, fsBackBtnRect.x + 10.0f, fsBackBtnRect.y + 9.0f, 18.0f, 18.0f,
+                           fade(pal.accent, anim));
         font.render(windowW, windowH, 0, iconAtlas.textureId);
 
         font.beginBatch();
-        font.addTextVCentered(fsBackBtnRect.x + 34.0f, fsBackBtnRect.y, fsBackBtnRect.h, "Back", pal.accent);
+        font.addTextVCentered(fsBackBtnRect.x + 34.0f, fsBackBtnRect.y, fsBackBtnRect.h, "Back", fade(pal.accent, anim));
         font.render(windowW, windowH);
 
         // Center Filename & Counter
@@ -3512,22 +3696,23 @@ public:
         fsCloseBtnRect.isHovered = isInside(mouseX, mouseY, fsCloseBtnRect.x, fsCloseBtnRect.y, btnS, btnS);
 
         font.beginBatch();
-        Color4 fsFavBg = selectedRecord.starred ? Color4::Hex(0xEF4444, 0.9f) : (fsFavBtnRect.isHovered ? pal.btnHover : pal.cardBg);
+        Color4 fsFavBg = fade(selectedRecord.starred ? Color4::Hex(0xEF4444, 0.9f)
+                                                     : (fsFavBtnRect.isHovered ? pal.btnHover : pal.cardBg), anim);
         font.addRoundedRect(fsFavBtnRect.x, fsFavBtnRect.y, btnS, btnS, 8.0f, fsFavBg);
-        if (fsViewerBtnRect.isHovered) font.addRoundedRect(fsViewerBtnRect.x, fsViewerBtnRect.y, btnS, btnS, 8.0f, pal.btnHover);
-        if (fsCloseBtnRect.isHovered) font.addRoundedRect(fsCloseBtnRect.x, fsCloseBtnRect.y, btnS, btnS, 8.0f, pal.btnHover);
+        if (fsViewerBtnRect.isHovered) font.addRoundedRect(fsViewerBtnRect.x, fsViewerBtnRect.y, btnS, btnS, 8.0f, fade(pal.btnHover, anim));
+        if (fsCloseBtnRect.isHovered) font.addRoundedRect(fsCloseBtnRect.x, fsCloseBtnRect.y, btnS, btnS, 8.0f, fade(pal.btnHover, anim));
         font.render(windowW, windowH);
 
         font.beginBatch();
         iconAtlas.drawIcon(font, selectedRecord.starred ? ICON_HEART_FILLED : ICON_HEART,
                            fsFavBtnRect.x + 8.0f, fsFavBtnRect.y + 8.0f, 20.0f, 20.0f,
-                           selectedRecord.starred ? Color4(1, 1, 1, anim) : pal.textPrimary);
+                           selectedRecord.starred ? Color4(1, 1, 1, anim) : fade(pal.textPrimary, anim));
         iconAtlas.drawIcon(font, ICON_EXTERNAL_LINK,
                            fsViewerBtnRect.x + 8.0f, fsViewerBtnRect.y + 8.0f, 20.0f, 20.0f,
-                           pal.textPrimary);
+                           fade(pal.textPrimary, anim));
         iconAtlas.drawIcon(font, ICON_CLOSE,
                            fsCloseBtnRect.x + 8.0f, fsCloseBtnRect.y + 8.0f, 20.0f, 20.0f,
-                           pal.textSecondary);
+                           fade(pal.textSecondary, anim));
         font.render(windowW, windowH, 0, iconAtlas.textureId);
     }
 };

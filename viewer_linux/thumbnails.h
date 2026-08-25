@@ -7,6 +7,7 @@
 #include "silver_config.h"
 #include "silver_xdgthumb.h"
 #include "silver_anim.h"
+#include "silver_constants.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -40,6 +41,9 @@ struct ThumbnailItem {
     bool inProgress = false;
     bool failed = false;      // decode attempted and failed - stop retrying
     uint64_t lastUsedFrame = 0;
+    int atlasSlot = -1;
+    float atlasU0 = 0.0f, atlasV0 = 0.0f;
+    float atlasU1 = 1.0f, atlasV1 = 1.0f;
 };
 
 struct DecodedThumb {
@@ -90,6 +94,33 @@ public:
     int diskCacheQuality = 85;
     std::vector<int> tiers = { 96, 160, 256, 384, 512 };
     float tierHeadroom = 1.35f;
+    float pixelScale = 1.0f;
+
+    // Gallery mode packs the active tier into one 2D texture. The standalone
+    // viewer leaves this disabled because its filmstrip is already small and
+    // individual textures simplify full-image navigation.
+    bool atlasEnabled = false;
+    GLuint atlasTexture = 0;
+    int atlasEdge = 0;
+    int atlasSize = 0;
+    int atlasColumns = 0;
+    int atlasNextSlot = 0;
+    std::vector<std::string> atlasOwners;
+    struct RetiredAtlas { GLuint texture = 0; size_t bytes = 0; };
+    std::deque<RetiredAtlas> retiredAtlases;
+    std::unordered_set<std::string> atlasVisiblePaths;
+    GLuint uploadPbos[3] = { 0, 0, 0 };
+    int uploadPboIndex = 0;
+
+    void setAtlasEnabled(bool enabled) { atlasEnabled = enabled; }
+
+    bool isAtlasTexture(GLuint texture) const {
+        if (!texture) return false;
+        if (texture == atlasTexture) return true;
+        for (const RetiredAtlas& atlas : retiredAtlases)
+            if (texture == atlas.texture) return true;
+        return false;
+    }
 
     // One cached image per photo, at the largest tier. Every smaller size is
     // derived from it in memory (~2 ms) rather than decoded from the original
@@ -129,8 +160,8 @@ public:
         useSharedCache = c.flag("thumbnails.useSharedCache", true);
     }
 
-    void setMemoryBudgetMegabytes(int megabytes) {
-        maxResidentBytes = (size_t)std::max(16, megabytes) * 1024ull * 1024ull;
+    void setPixelScale(float scale) {
+        pixelScale = (scale >= silver::defaults::minPixelScale) ? scale : 1.0f;
     }
 
     float scrollOffset = 0.0f;
@@ -167,10 +198,44 @@ public:
             if (w.joinable()) w.join();
         }
         for (auto& [path, item] : cache) {
-            if (item.texId) {
+            if (item.texId && !isAtlasTexture(item.texId)) {
                 glDeleteTextures(1, &item.texId);
             }
         }
+        if (atlasTexture) glDeleteTextures(1, &atlasTexture);
+        for (const RetiredAtlas& atlas : retiredAtlases)
+            if (atlas.texture) glDeleteTextures(1, &atlas.texture);
+        if (uploadPbos[0]) glDeleteBuffers(3, uploadPbos);
+    }
+
+    void uploadPixelsPbo(int x, int y, int w, int h,
+                         const unsigned char* pixels) {
+        if (!uploadPbos[0]) glGenBuffers(3, uploadPbos);
+        GLuint pbo = uploadPbos[uploadPboIndex];
+        uploadPboIndex = (uploadPboIndex + 1) % 3;
+        const GLsizeiptr bytes = (GLsizeiptr)((size_t)w * h * 4u);
+
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+        // Orphaning plus a three-buffer ring prevents an upload from waiting on
+        // the DMA operation issued for either of the previous two frames.
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, bytes, nullptr, GL_STREAM_DRAW);
+        void* dst = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, bytes,
+                                     GL_MAP_WRITE_BIT |
+                                     GL_MAP_INVALIDATE_BUFFER_BIT);
+        if (dst) {
+            memcpy(dst, pixels, (size_t)bytes);
+            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
+                            GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        } else {
+            // A conservative fallback for drivers that expose PBOs but refuse
+            // a transient mapping under memory pressure.
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
+                            GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+            return;
+        }
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     }
 
     // -------------------------------------------------------------------------
@@ -406,11 +471,97 @@ public:
     // -------------------------------------------------------------------------
     // Request API
     // -------------------------------------------------------------------------
+    void releaseUnusedRetiredAtlases() {
+        for (auto it = retiredAtlases.begin(); it != retiredAtlases.end();) {
+            bool visibleReference = false;
+            for (const std::string& path : atlasVisiblePaths) {
+                auto cached = cache.find(path);
+                if (cached != cache.end() && cached->second.texId == it->texture) {
+                    visibleReference = true;
+                    break;
+                }
+            }
+            if (visibleReference) { ++it; continue; }
+
+            GLuint expired = it->texture;
+            for (auto& kv : cache) {
+                ThumbnailItem& item = kv.second;
+                if (item.texId == expired) {
+                    item.texId = 0;
+                    item.atlasSlot = -1;
+                    item.ready = false;
+                    item.inProgress = false;
+                }
+            }
+            glDeleteTextures(1, &expired);
+            it = retiredAtlases.erase(it);
+        }
+    }
+
+    void prepareAtlas(int edge, const std::vector<std::string>& visiblePaths) {
+        if (!atlasEnabled || edge <= 0 || (atlasTexture && atlasEdge == edge)) return;
+
+        atlasVisiblePaths.clear();
+        atlasVisiblePaths.insert(visiblePaths.begin(), visiblePaths.end());
+
+        if (atlasTexture)
+            retiredAtlases.push_back({ atlasTexture, textureBytes(atlasSize, atlasSize) });
+        atlasTexture = 0;
+
+        // Retired pages remain only while a currently visible tile references
+        // them. This also handles rapid multi-tier zoom without flashing.
+        releaseUnusedRetiredAtlases();
+
+        GLint maxTexture = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTexture);
+        int configured = SilverConfig::get().integer("thumbnails.atlasSize", 4096);
+        atlasSize = std::min(std::max(edge, configured), std::max(edge, (int)maxTexture));
+        atlasSize = (atlasSize / edge) * edge;
+        atlasColumns = std::max(1, atlasSize / edge);
+        atlasNextSlot = 0;
+        atlasOwners.assign((size_t)atlasColumns * atlasColumns, {});
+        atlasEdge = edge;
+
+        glGenTextures(1, &atlasTexture);
+        glBindTexture(GL_TEXTURE_2D, atlasTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, atlasSize, atlasSize,
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        residentTextures = 1 + retiredAtlases.size();
+        residentBytes = textureBytes(atlasSize, atlasSize);
+        for (const RetiredAtlas& old : retiredAtlases) residentBytes += old.bytes;
+    }
+
+    int acquireAtlasSlot(const std::string& path) {
+        const int capacity = atlasColumns * atlasColumns;
+        if (atlasNextSlot < capacity) return atlasNextSlot++;
+
+        auto victim = cache.end();
+        for (auto it = cache.begin(); it != cache.end(); ++it) {
+            if (it->second.texId != atlasTexture || it->second.atlasSlot < 0 ||
+                frameCounter - it->second.lastUsedFrame < 3) continue;
+            if (victim == cache.end() ||
+                it->second.lastUsedFrame < victim->second.lastUsedFrame) victim = it;
+        }
+        if (victim == cache.end()) return -1;
+        int slot = victim->second.atlasSlot;
+        victim->second.texId = 0;
+        victim->second.atlasSlot = -1;
+        victim->second.ready = false;
+        atlasOwners[(size_t)slot].clear();
+        return slot;
+    }
+
     // Snap to one of the configured tiers so zooming reuses decoded textures
     // instead of re-decoding the library on every pinch step.
     int quantizeEdge(float cellPixels) const {
-        if (tiers.empty()) return 512;
-        float need = cellPixels * tierHeadroom; // headroom for HiDPI and hover lift
+        if (tiers.empty()) return silver::defaults::thumbnailEdge;
+        float need = cellPixels * pixelScale * tierHeadroom;
         for (int t : tiers) {
             if (need <= (float)t) return t;
         }
@@ -433,6 +584,11 @@ public:
     // Replaces the pending queue with exactly what is on screen right now.
     // Anything scrolled out of view stops competing for decode threads.
     void requestVisibleSet(const std::vector<std::string>& paths, int edge) {
+        if (atlasEnabled) {
+            atlasVisiblePaths.clear();
+            atlasVisiblePaths.insert(paths.begin(), paths.end());
+        }
+        prepareAtlas(edge, paths);
         std::lock_guard<std::mutex> lock(queueLock);
 
         // Anything still queued is about to be dropped, so clear its pending
@@ -696,8 +852,16 @@ public:
                 continue;
             }
 
+            // A tier switch can complete while an old decode is in flight.
+            // Never place stale-sized pixels into the active atlas.
+            if (atlasEnabled && dt.edge != atlasEdge) {
+                ThumbnailItem& stale = cache[dt.path];
+                stale.inProgress = false;
+                continue;
+            }
+
             ThumbnailItem& item = cache[dt.path];
-            if (item.texId) {
+            if (item.texId && !atlasEnabled) {
                 glDeleteTextures(1, &item.texId);
                 item.texId = 0;
                 if (residentTextures) residentTextures--;
@@ -705,21 +869,43 @@ public:
                 residentBytes = (residentBytes > old) ? residentBytes - old : 0;
             }
 
-            GLuint tid = 0;
-            glGenTextures(1, &tid);
-            glBindTexture(GL_TEXTURE_2D, tid);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, dt.w, dt.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, dt.data.data());
-            // No mipmaps. The tier is chosen to match the on-screen cell size,
-            // so the texture is already near 1:1 - a mip chain would cost 33%
-            // more memory and a glGenerateMipmap per upload to be sampled from
-            // level 0 anyway.
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glBindTexture(GL_TEXTURE_2D, 0);
+            if (atlasEnabled) {
+                int slot = (item.texId == atlasTexture && item.atlasSlot >= 0)
+                    ? item.atlasSlot : acquireAtlasSlot(dt.path);
+                if (slot < 0) {
+                    item.inProgress = false;
+                    continue;
+                }
+                int cellX = (slot % atlasColumns) * atlasEdge;
+                int cellY = (slot / atlasColumns) * atlasEdge;
+                glBindTexture(GL_TEXTURE_2D, atlasTexture);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                uploadPixelsPbo(cellX, cellY, dt.w, dt.h, dt.data.data());
+                glBindTexture(GL_TEXTURE_2D, 0);
 
-            item.texId = tid;
+                item.texId = atlasTexture;
+                item.atlasSlot = slot;
+                // Half-texel inset prevents linear sampling from bleeding into
+                // the neighbouring cell without requiring padded source data.
+                item.atlasU0 = (cellX + 0.5f) / (float)atlasSize;
+                item.atlasV0 = (cellY + 0.5f) / (float)atlasSize;
+                item.atlasU1 = (cellX + dt.w - 0.5f) / (float)atlasSize;
+                item.atlasV1 = (cellY + dt.h - 0.5f) / (float)atlasSize;
+                atlasOwners[(size_t)slot] = dt.path;
+            } else {
+                GLuint tid = 0;
+                glGenTextures(1, &tid);
+                glBindTexture(GL_TEXTURE_2D, tid);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, dt.w, dt.h, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                uploadPixelsPbo(0, 0, dt.w, dt.h, dt.data.data());
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                item.texId = tid;
+            }
             item.width = dt.w;
             item.height = dt.h;
             item.loadedEdge = dt.edge;
@@ -729,10 +915,19 @@ public:
             item.inProgress = false;
             item.failed = false;
             item.lastUsedFrame = frameCounter;
-            residentTextures++;
-            residentBytes += textureBytes(dt.w, dt.h);
+            if (!atlasEnabled) {
+                residentTextures++;
+                residentBytes += textureBytes(dt.w, dt.h);
+            }
 
             uploaded++;
+        }
+
+        if (atlasEnabled && uploaded > 0) {
+            releaseUnusedRetiredAtlases();
+            residentTextures = 1 + retiredAtlases.size();
+            residentBytes = atlasTexture ? textureBytes(atlasSize, atlasSize) : 0;
+            for (const RetiredAtlas& old : retiredAtlases) residentBytes += old.bytes;
         }
 
         evictIfNeeded();
@@ -790,6 +985,9 @@ public:
     }
 
     void evictIfNeeded() {
+        // Atlas residency is bounded by its fixed slot count; acquireAtlasSlot
+        // performs per-slot LRU replacement without deleting the shared texture.
+        if (atlasEnabled) return;
         // Fast path: nothing to do, and no cache walk. This runs every frame and
         // the cache can hold tens of thousands of entries.
         if (residentBytes <= maxResidentBytes) return;
@@ -1048,6 +1246,14 @@ public:
         return outstandingWork.load(std::memory_order_relaxed) > 0;
     }
 
+    // Rendering can sleep while workers decode: each completed worker posts a
+    // GLFW event. Keep drawing only when the render thread has a backlog of
+    // decoded pixels that still needs bounded GPU uploads across more frames.
+    bool hasReadyUploads() const {
+        std::lock_guard<std::mutex> lock(readyLock);
+        return !readyQueue.empty();
+    }
+
     void recountOutstanding() {
         outstandingWork.store((int)(loadQueue.size() + inFlightSet.size() + pendingUpload.size()),
                               std::memory_order_relaxed);
@@ -1177,7 +1383,9 @@ private:
     void enqueueLocked(const std::string& path, int edge, bool highPriority) {
         auto it = cache.find(path);
         if (it != cache.end()) {
-            if (it->second.ready && it->second.loadedEdge >= edge) return; // already resident
+            bool residentForTarget = it->second.ready && it->second.loadedEdge >= edge &&
+                (!atlasEnabled || it->second.texId == atlasTexture);
+            if (residentForTarget) return;
             if (it->second.failed) return;                                 // known bad file
         }
 

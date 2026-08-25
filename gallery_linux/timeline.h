@@ -30,6 +30,7 @@ struct TimelineItem {
     bool isSelected = false;
     float hoverAnim = 0.0f;
     float selectAnim = 0.0f;
+    uint64_t lastVisibleFrame = 0;
 
     // Spring state for the second-order motion solver.
     silveranim::RectVelocity motionVel;
@@ -69,9 +70,17 @@ enum TimelineGrouping {
 
 class TimelineManager {
 public:
+    struct RegroupRect {
+        float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
+        bool valid = false;
+    };
+
     std::vector<TimelineSection> sections;
     std::vector<TimelineItem*> flatVisibleItems;
     std::vector<TimelineItem*> flatAllItems;
+    std::vector<RegroupRect> regroupRects;
+    bool regroupTransitionActive = false;
+    uint64_t visibilityFrame = 1;
     float totalContentHeight = 0.0f;
     int totalPhotoCount = 0;
     std::string selectedPath = "";
@@ -362,11 +371,22 @@ public:
     // avoids copying a GalleryRecord (five strings) for every photo in the
     // library - the hitch that made this transition feel laggy.
     //
-    // Because each item keeps its animated position, the following relayout
-    // glides them to their new slots instead of snapping.
+    // Section-local coordinates are unrelated after regrouping. Preserve the
+    // records and hover/selection state, but establish fresh geometry; trying
+    // to glide from the old section positions makes many tiles cross through
+    // the top section and overlap.
     // -------------------------------------------------------------------------
     void regroup(float gridAreaW, bool hasFolderBanner) {
         if (sections.empty()) return;
+
+        regroupRects.assign((size_t)totalPhotoCount, {});
+        for (const TimelineItem* itm : flatVisibleItems) {
+            if (!itm || !itm->isVisible || itm->flatIndex < 0 ||
+                itm->flatIndex >= totalPhotoCount) continue;
+            regroupRects[(size_t)itm->flatIndex] = {
+                itm->animX, itm->animY, itm->animW, itm->animH, true
+            };
+        }
 
         std::vector<TimelineItem> flat;
         flat.reserve((size_t)totalPhotoCount);
@@ -420,7 +440,82 @@ public:
             for (auto& itm : sec.items) flatAllItems.push_back(&itm);
         }
 
-        relayout(gridAreaW, hasFolderBanner, /*snapAll=*/false);
+        relayout(gridAreaW, hasFolderBanner, /*snapAll=*/true);
+
+        // Old section-local coordinates no longer describe meaningful screen
+        // positions. The caller starts a safe transition after restoring its
+        // viewport anchor.
+        for (auto& sec : sections) {
+            for (auto& itm : sec.items) {
+                itm.inAnimBand = false;
+                itm.isVisible = false;
+                itm.isHovered = false;
+            }
+        }
+        flatVisibleItems.clear();
+    }
+
+    // Preserve real positions for tiles shared by both views. Newly revealed
+    // tiles enter with a short positional offset instead of snapping. Travel is
+    // bounded so regrouping never streams records across the whole viewport.
+    void beginVisibleRegroupAnimation(float oldScrollY, float scrollY, float windowH) {
+        if (sections.empty()) return;
+
+        const float scale = std::clamp(
+            SilverConfig::get().num("animation.regroupStartScale", 0.88f),
+            0.5f, 1.0f);
+        const float enterOffset = SilverConfig::get().num(
+            "animation.regroupEnterOffset", 24.0f);
+        const float maxTravel = SilverConfig::get().num(
+            "animation.maxVisibleLayoutTravel", 180.0f);
+        const float maxSizeRatio = std::max(1.0f, SilverConfig::get().num(
+            "animation.regroupMaxSizeRatio", 1.18f));
+        const float viewTop = scrollY - 60.0f;
+        const float viewBottom = scrollY + windowH + 60.0f;
+        const int start = std::max(0, firstSectionAtOrAfter(viewTop) - 1);
+
+        flatVisibleItems.clear();
+        for (int s = start; s < (int)sections.size(); ++s) {
+            TimelineSection& sec = sections[(size_t)s];
+            if (sec.startY > viewBottom) break;
+            for (auto& itm : sec.items) {
+                if (itm.y + itm.h < viewTop || itm.y > viewBottom) continue;
+                const RegroupRect* old = itm.flatIndex >= 0 &&
+                    itm.flatIndex < (int)regroupRects.size() &&
+                    regroupRects[(size_t)itm.flatIndex].valid
+                    ? &regroupRects[(size_t)itm.flatIndex] : nullptr;
+
+                if (old) {
+                    // Convert the old content coordinate so its screen position
+                    // remains identical after the anchor changes scrollY.
+                    float oldX = old->x;
+                    float oldY = old->y + (scrollY - oldScrollY);
+                    itm.animX = itm.x + std::clamp(oldX - itm.x, -maxTravel, maxTravel);
+                    itm.animY = itm.y + std::clamp(oldY - itm.y, -maxTravel, maxTravel);
+                    // A Day -> Year transition can change a tile by several
+                    // hundred percent. Drawing that literal old size over the
+                    // dense destination grid creates the broken mosaic frame.
+                    // Preserve motion, but bound the visual scale component.
+                    const float sizeRatio = itm.w > 0.0f ? old->w / itm.w : 1.0f;
+                    const bool extremeResize = sizeRatio < 1.0f / maxSizeRatio ||
+                                               sizeRatio > maxSizeRatio;
+                    itm.animW = extremeResize ? itm.w : old->w;
+                    itm.animH = extremeResize ? itm.h : old->h;
+                } else {
+                    itm.animW = itm.w * scale;
+                    itm.animH = itm.h * scale;
+                    itm.animX = itm.x + (itm.w - itm.animW) * 0.5f;
+                    itm.animY = itm.y + (itm.h - itm.animH) * 0.5f + enterOffset;
+                }
+                itm.motionVel.clear();
+                itm.inAnimBand = true;
+                itm.isVisible = true;
+                itm.lastVisibleFrame = visibilityFrame;
+                flatVisibleItems.push_back(&itm);
+            }
+        }
+        regroupRects.clear();
+        regroupTransitionActive = !flatVisibleItems.empty();
     }
 
     void buildSectionSubtitles() {
@@ -460,9 +555,18 @@ public:
         float availW = gridAreaW - (sidePadding * 2.0f);
         if (availW < 100.0f) availW = 100.0f;
 
+        float gridOriginX = sidePadding;
         if (!isAutoZoom) {
+            // Zoom chooses the density, then the active columns consume the
+            // complete grid width. Keeping the raw desired size left a large
+            // unused strip whenever an integer number of square tiles did not
+            // divide the viewport.
             float desiredItemSize = minItemSize + zoomScale * (maxItemSize - minItemSize);
-            columns = std::clamp((int)std::round((availW + gridGap) / (desiredItemSize + gridGap)), 1, maxColumns);
+            columns = std::clamp((int)std::floor((availW + gridGap) /
+                                                 (desiredItemSize + gridGap)),
+                                 1, maxColumns);
+            itemSize = (availW - gridGap * (columns - 1)) / (float)columns;
+            itemSize = std::clamp(itemSize, tileMinSize, availW);
         } else {
             if (availW < 360.0f) columns = 2;
             else if (availW < 560.0f) columns = 3;
@@ -476,8 +580,10 @@ public:
             updatePresetFromScale();
         }
 
-        itemSize = (availW - (gridGap * (columns - 1))) / (float)columns;
-        if (itemSize < tileMinSize) itemSize = tileMinSize;
+        if (isAutoZoom) {
+            itemSize = (availW - (gridGap * (columns - 1))) / (float)columns;
+            if (itemSize < tileMinSize) itemSize = tileMinSize;
+        }
 
         // Leave room for the folder breadcrumb banner so headers never overlap.
         float curY = topOffset + (hasFolderBanner ? folderBannerHeight : 0.0f);
@@ -498,7 +604,7 @@ public:
                 itm.itemIndexInSection = i;
                 itm.w = itemSize;
                 itm.h = itemSize;
-                itm.x = sidePadding + col * (itemSize + gridGap);
+                itm.x = gridOriginX + col * (itemSize + gridGap);
                 itm.y = curY + row * (itemSize + gridGap);
                 itm.isSelected = (!selectedPath.empty() && itm.record.path == selectedPath);
                 if (itm.isSelected) selectedFlatIndex = itm.flatIndex;
@@ -623,6 +729,24 @@ public:
     }
 
     void updateVisibility(float scrollY, float windowH, float mouseX, float mouseY, float dt = 0.016f) {
+        // Preserve the true previous-frame set before rebuilding it. Items in a
+        // section outside this frame's animation band are not visited below;
+        // leaving their old isVisible flag set made them look continuously
+        // visible when they later re-entered, so stale positions flew in from
+        // the top after zooming and scrolling.
+        const uint64_t previousFrame = visibilityFrame;
+        ++visibilityFrame;
+        if (visibilityFrame == 0) {
+            visibilityFrame = 1;
+            for (TimelineItem* itm : flatAllItems)
+                if (itm) itm->lastVisibleFrame = 0;
+        }
+        for (TimelineItem* itm : flatVisibleItems) {
+            if (itm) {
+                itm->isVisible = false;
+                itm->isHovered = false;
+            }
+        }
         flatVisibleItems.clear();
         if (sections.empty()) return;
 
@@ -637,24 +761,19 @@ public:
         float bandBottom = viewBottom + band;
 
         int startIdx = firstSectionAtOrAfter(bandTop);
+        bool regroupStillMoving = false;
 
         for (int s = startIdx; s < (int)sections.size(); ++s) {
             TimelineSection& sec = sections[s];
             if (sec.startY > bandBottom) break;
 
             for (auto& itm : sec.items) {
-                // Off-screen rows were snapped at layout time, so anything we
-                // animate here is genuinely on screen.
-                silveranim::driveRect(itm.animX, itm.animY, itm.animW, itm.animH, itm.motionVel,
-                                      itm.x, itm.y, itm.w, itm.h, anim.chLayout, dt);
-
-                float curTop = itm.animY;
-                float curLeft = itm.animX;
-                float curBottom = curTop + itm.animH;
-                float curRight = curLeft + itm.animW;
-
+                const bool wasVisible = itm.lastVisibleFrame == previousFrame;
                 bool wasInBand = itm.inAnimBand;
-                itm.inAnimBand = (curBottom >= bandTop && curTop <= bandBottom);
+                bool targetInBand = (itm.y + itm.h >= bandTop && itm.y <= bandBottom);
+                bool targetVisible = (itm.y + itm.h >= viewTop - 60.0f &&
+                                      itm.y <= viewBottom + 60.0f);
+                itm.inAnimBand = targetInBand;
 
                 if (!wasInBand && itm.inAnimBand) {
                     // Just entered the band from far away - start it at its slot
@@ -664,18 +783,62 @@ public:
                     itm.animW = itm.w;
                     itm.animH = itm.h;
                     itm.motionVel.clear();
-                    curTop = itm.y;
-                    curLeft = itm.x;
-                    curBottom = curTop + itm.h;
-                    curRight = curLeft + itm.w;
                 }
 
-                if (curBottom >= viewTop - 60.0f && curTop <= viewBottom + 60.0f) {
+                // If zooming moved a destination into view while its animated
+                // position is still outside the viewport, showing that stale
+                // trajectory makes the photo fly down from the top. Entering
+                // tiles start at their real slot; tiles already on screen keep
+                // their ordinary smooth reflow.
+                bool animOutsideView = (itm.animY + itm.animH < viewTop - 60.0f ||
+                                        itm.animY > viewBottom + 60.0f);
+                float travelX = std::abs(itm.animX - itm.x);
+                float travelY = std::abs(itm.animY - itm.y);
+                bool travelsTooFar = std::max(travelX, travelY) > anim.maxVisibleLayoutTravel;
+                // A large travel is suspicious only for a tile newly entering
+                // the viewport. Tiles that were already visible must keep their
+                // shared reflow animation, otherwise a zoom makes half the grid
+                // glide while the other half snaps. The outside-view check
+                // still prevents genuinely stale positions flying in from the
+                // top or bottom.
+                if (targetVisible && (animOutsideView || (travelsTooFar && !wasVisible))) {
+                    silveranim::snapRect(itm.animX, itm.animY, itm.animW, itm.animH,
+                                         itm.x, itm.y, itm.w, itm.h);
+                    itm.motionVel.clear();
+                }
+
+                if (itm.inAnimBand) {
+                    silveranim::driveRect(itm.animX, itm.animY, itm.animW, itm.animH, itm.motionVel,
+                                          itm.x, itm.y, itm.w, itm.h, anim.chLayout, dt);
+                }
+
+                if (regroupTransitionActive && targetVisible) {
+                    regroupStillMoving = regroupStillMoving ||
+                        std::abs(itm.animX - itm.x) > anim.settleEpsilon ||
+                        std::abs(itm.animY - itm.y) > anim.settleEpsilon ||
+                        std::abs(itm.animW - itm.w) > anim.settleEpsilon ||
+                        std::abs(itm.animH - itm.h) > anim.settleEpsilon;
+                }
+
+                float curTop = itm.animY;
+                float curLeft = itm.animX;
+                float curBottom = curTop + itm.animH;
+                float curRight = curLeft + itm.animW;
+                bool animatedVisible = (curBottom >= viewTop - 60.0f &&
+                                        curTop <= viewBottom + 60.0f);
+                bool shouldDraw = targetVisible ||
+                                  (!regroupTransitionActive && animatedVisible);
+
+                // Ordinary same-group reflows keep both sides alive. A grouping
+                // transition is different: only destinations in the new view
+                // draw, preventing obsolete Year cells overlaying the Day grid.
+                if (shouldDraw) {
                     itm.isVisible = true;
                     itm.isHovered = (mouseX >= curLeft && mouseX <= curRight &&
                                      mouseY >= curTop - scrollY && mouseY <= curBottom - scrollY &&
                                      mouseY > 60.0f);
                     itm.isSelected = (!selectedPath.empty() && itm.record.path == selectedPath);
+                    itm.lastVisibleFrame = visibilityFrame;
                     flatVisibleItems.push_back(&itm);
                 } else {
                     itm.isVisible = false;
@@ -692,6 +855,8 @@ public:
                 silveranim::driveFade(itm.selectAnim, itm.selectVel, itm.isSelected ? 1.0f : 0.0f, anim.chSelect, dt);
             }
         }
+        if (regroupTransitionActive && !regroupStillMoving)
+            regroupTransitionActive = false;
     }
 
     // Look up a laid-out item by path. Pointers stay valid across relayout(),

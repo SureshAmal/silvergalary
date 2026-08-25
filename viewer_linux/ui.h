@@ -659,26 +659,20 @@ public:
         }
 
         // =============================================================
-        // B. LOADING SHIMMER / SKELETON INDICATOR (for 60+ MP images)
+        // B. QUIET FIRST-LOAD INDICATOR
         // =============================================================
-        if (isImageDecoding && !isGridView) {
+        // Navigation normally has a thumbnail ready, so never cover it with a
+        // decoding banner. Only a truly blank first load gets a small,
+        // text-free activity mark.
+        if (isImageDecoding && !isGridView && currentTextureId == 0) {
             font.beginBatch();
-            float sw = 42.0f * uiScale;
-            float sh = 42.0f * uiScale;
-            float sx = ((float)windowW - sw) * 0.5f;
-            float sy = topBarH + 20.0f;
-
-            Color4 sBg = pal.cardBg;
-            sBg.a = 0.94f;
-            font.addRoundedRect(sx + 2, sy + 2, sw, sh, sh * 0.5f, Color4(0, 0, 0, 0.35f));
-            font.addRoundedRect(sx, sy, sw, sh, sh * 0.5f, sBg);
-            font.addRoundedBorder(sx, sy, sw, sh, sh * 0.5f, 1.0f, pal.cardBorder);
-            float iconSize = 22.0f * uiScale;
-            iconAtlas.drawIconRotated(font, ICON_LOADER,
-                                      sx + (sw - iconSize) * 0.5f,
-                                      sy + (sh - iconSize) * 0.5f,
-                                      iconSize, iconSize, shimmerPhase * 2.2f, pal.accent);
-            font.render(windowW, windowH, 0, iconAtlas.textureId);
+            float pulse = 0.5f + 0.5f * sinf(shimmerPhase);
+            Color4 pulseCol = pal.accent;
+            pulseCol.a = 0.35f + 0.55f * pulse;
+            float dot = 8.0f * uiScale;
+            font.addRoundedRect(((float)windowW - dot) * 0.5f, topBarH + 18.0f,
+                                dot, dot, dot * 0.5f, pulseCol);
+            font.render(windowW, windowH);
         }
 
         // =============================================================

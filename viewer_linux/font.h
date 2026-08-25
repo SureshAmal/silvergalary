@@ -2,6 +2,8 @@
 
 #include "gl_loader.h"
 #include "theme.h"
+#include "silver_constants.h"
+#include "silver_config.h"
 #include <string>
 #include <vector>
 #include <cmath>
@@ -64,14 +66,27 @@ public:
     void invalidateViewport() { viewportValid = false; }
 
     float pixelScale = 1.0f;
-    float requestedSize = 15.0f;   // in points, before scaling
+    float requestedSize = silver::defaults::baseFontPoints;   // in points, before scaling
 
     void setPixelScale(float scale) {
-        if (scale < 0.5f) scale = 1.0f;
+        if (scale < silver::defaults::minPixelScale) scale = 1.0f;
         if (std::abs(scale - pixelScale) < 0.01f) return;
         pixelScale = scale;
         viewportValid = false;
         applyTextConfig();
+    }
+
+    // Convert a layout coordinate to the nearest physical framebuffer pixel.
+    // Use this for static image edges and hairlines; animated surfaces keep
+    // their fractional coordinates so motion remains continuous.
+    float snapToPixel(float value) const {
+        return std::round(value * pixelScale) / pixelScale;
+    }
+
+    int cornerSegments(float radius) const {
+        int wanted = (int)std::ceil(radius * pixelScale * 0.35f);
+        return std::clamp(wanted, silver::limits::minCornerSegments,
+                          silver::limits::maxCornerSegments);
     }
 
     // Re-read text settings (size, hinting) and rebuild the atlas if needed.
@@ -123,7 +138,14 @@ public:
     ~FontRenderer() {
         if (fontTexture) glDeleteTextures(1, &fontTexture);
         if (emojiTexture) glDeleteTextures(1, &emojiTexture);
+        if (persistentMapped && vbo) {
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+        }
+        for (GLsync& fence : streamFences)
+            if (fence) glDeleteSync(fence);
         if (vbo) glDeleteBuffers(1, &vbo);
+        if (overflowVbo) glDeleteBuffers(1, &overflowVbo);
         if (vao) glDeleteVertexArrays(1, &vao);
         if (shaderProgram) glDeleteProgram(shaderProgram);
     }
@@ -138,8 +160,13 @@ public:
     int drawCallsLastFrame = 0;
     int batchesLastFrame = 0;
     size_t verticesLastFrame = 0;
+    unsigned char* persistentMapped = nullptr;
+    GLuint overflowVbo = 0;
+    size_t streamSegmentBytes = 0;
+    int streamSegment = -1;
+    GLsync streamFences[4] = { nullptr, nullptr, nullptr, nullptr };
 
-    bool init(const char* fontPath = nullptr, float size = 15.0f) {
+    bool init(const char* fontPath = nullptr, float size = silver::defaults::baseFontPoints) {
         fontSize = size;
         requestedSize = size;
 
@@ -319,6 +346,31 @@ public:
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
 
+        GLint major = 0, minor = 0;
+        glGetIntegerv(GL_MAJOR_VERSION, &major);
+        glGetIntegerv(GL_MINOR_VERSION, &minor);
+        bool hasBufferStorage = major > 4 || (major == 4 && minor >= 4) ||
+                                glfwExtensionSupported("GL_ARB_buffer_storage");
+        if (hasBufferStorage) {
+            size_t totalBytes = (size_t)std::max(32,
+                SilverConfig::get().integer("rendering.vertexBufferMegabytes", 32))
+                * 1024u * 1024u;
+            streamSegmentBytes = totalBytes / 4u;
+            glBufferStorage(GL_ARRAY_BUFFER, (GLsizeiptr)totalBytes, nullptr,
+                            GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT |
+                            GL_MAP_COHERENT_BIT);
+            persistentMapped = (unsigned char*)glMapBufferRange(
+                GL_ARRAY_BUFFER, 0, (GLsizeiptr)totalBytes,
+                GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT |
+                GL_MAP_COHERENT_BIT);
+            if (!persistentMapped) {
+                glDeleteBuffers(1, &vbo);
+                glGenBuffers(1, &vbo);
+                glBindBuffer(GL_ARRAY_BUFFER, vbo);
+                streamSegmentBytes = 0;
+            }
+        }
+
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(UIVertex), (void*)offsetof(UIVertex, x));
 
@@ -491,7 +543,7 @@ public:
         addRect(x + w - radius, y + radius, radius, h - 2 * radius, col);
 
         auto addCorner = [&](float cx, float cy, float startAngle) {
-            const int segments = 8;
+            const int segments = cornerSegments(radius);
             float step = (M_PI * 0.5f) / segments;
             for (int i = 0; i < segments; ++i) {
                 float a1 = startAngle + i * step;
@@ -531,7 +583,7 @@ public:
 
         // 4 smooth corner arcs
         auto addCornerBorder = [&](float cx, float cy, float startAngle) {
-            const int segments = 8;
+            const int segments = cornerSegments(radius);
             float step = (M_PI * 0.5f) / segments;
             for (int i = 0; i < segments; ++i) {
                 float a1 = startAngle + i * step;
@@ -894,10 +946,49 @@ public:
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
 
-        // Orphan the old storage so the driver never stalls waiting on the
-        // previous frame's draws, then fill it in one shot.
-        glBufferData(GL_ARRAY_BUFFER, frameVertices.size() * sizeof(UIVertex), nullptr, GL_STREAM_DRAW);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, frameVertices.size() * sizeof(UIVertex), frameVertices.data());
+        const size_t uploadBytes = frameVertices.size() * sizeof(UIVertex);
+        size_t streamOffset = 0;
+        bool usedPersistentUpload = false;
+        if (persistentMapped && uploadBytes <= streamSegmentBytes) {
+            usedPersistentUpload = true;
+            streamSegment = (streamSegment + 1) & 3;
+            GLsync& fence = streamFences[streamSegment];
+            if (fence) {
+                // Usually already signalled after three intervening frames.
+                // A short bounded wait is still cheaper than reallocating the
+                // buffer or overwriting vertices the GPU is consuming.
+                GLenum state = glClientWaitSync(fence, 0, 0);
+                if (state == GL_TIMEOUT_EXPIRED) {
+                    state = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000);
+                    if (state == GL_TIMEOUT_EXPIRED)
+                        glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT,
+                                         GL_TIMEOUT_IGNORED);
+                }
+                glDeleteSync(fence);
+                fence = nullptr;
+            }
+            streamOffset = (size_t)streamSegment * streamSegmentBytes;
+            memcpy(persistentMapped + streamOffset, frameVertices.data(), uploadBytes);
+        } else {
+            // OpenGL < 4.4 fallback: orphaning remains non-blocking on all
+            // supported drivers.
+            if (persistentMapped) {
+                if (!overflowVbo) glGenBuffers(1, &overflowVbo);
+                glBindBuffer(GL_ARRAY_BUFFER, overflowVbo);
+            }
+            glBufferData(GL_ARRAY_BUFFER, uploadBytes, nullptr, GL_STREAM_DRAW);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, uploadBytes, frameVertices.data());
+        }
+
+        const uintptr_t base = (uintptr_t)streamOffset;
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(UIVertex),
+                              (void*)(base + offsetof(UIVertex, x)));
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(UIVertex),
+                              (void*)(base + offsetof(UIVertex, u)));
+        glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(UIVertex),
+                              (void*)(base + offsetof(UIVertex, r)));
+        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(UIVertex),
+                              (void*)(base + offsetof(UIVertex, useTex)));
 
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -943,6 +1034,8 @@ public:
             glDrawArrays(GL_TRIANGLES, (GLint)cmd.first, (GLsizei)cmd.count);
             drawCallsLastFrame++;
         }
+        if (usedPersistentUpload)
+            streamFences[streamSegment] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (scissorOn) glDisable(GL_SCISSOR_TEST);
 
         glBindVertexArray(0);

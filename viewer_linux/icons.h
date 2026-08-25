@@ -19,6 +19,7 @@
 #include "silver_codec.h"
 #include "silver_config.h"
 #include "silver_icons_data.h"
+#include "silver_constants.h"
 
 #ifndef STB_INCLUDE_STB_RECT_PACK_H
 #include <stb_rect_pack.h>
@@ -36,6 +37,8 @@ enum IconType {
     ICON_1TO1,
     ICON_ROTATE,
     ICON_GRID,
+    ICON_GRID_2X2,
+    ICON_GRID_4X4,
     ICON_GRID_CHECK,
     ICON_TARGET,
     ICON_INFO,
@@ -84,7 +87,7 @@ public:
     float strokeScale = 1.25f;
 
     void setPixelScale(float scale) {
-        if (scale < 0.5f) scale = 1.0f;
+        if (scale < silver::defaults::minPixelScale) scale = 1.0f;
         if (std::abs(scale - pixelScale) < 0.01f) return;
         pixelScale = scale;
         resetAtlas();   // every cached size is now the wrong resolution
@@ -179,7 +182,7 @@ public:
         float sizePts = std::max(w, h);
         int px = (int)std::lround(sizePts * pixelScale);
         if (px < 4) px = 4;
-        if (px > 512) px = 512;
+        if (px > silver::limits::maxIconRasterPixels) px = silver::limits::maxIconRasterPixels;
 
         const Entry* e = ensure(type, px);
         if (!e) return;

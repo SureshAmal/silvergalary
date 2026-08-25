@@ -4,6 +4,7 @@
 #include "folder.h"
 #include "ui.h"
 #include "async_loader.h"
+#include "silver_constants.h"
 #include <GLFW/glfw3.h>
 #include <iostream>
 #include <algorithm>
@@ -11,11 +12,11 @@
 
 struct AppState {
     GLFWwindow* window = nullptr;
-    int windowW = 1280;
-    int windowH = 800;
+    int windowW = silver::defaults::viewerWindowWidth;
+    int windowH = silver::defaults::viewerWindowHeight;
     bool redrawPending = true;   // drives poll-vs-wait in the main loop
-    int fbW = 1280;
-    int fbH = 800;
+    int fbW = silver::defaults::viewerWindowWidth;
+    int fbH = silver::defaults::viewerWindowHeight;
 
     int savedWinX = 100, savedWinY = 100;
     int savedWinW = 1280, savedWinH = 800;
@@ -58,7 +59,6 @@ struct AppState {
     float dragStartPosX = 0, dragStartPosY = 0;
 
     double lastClickTime = 0.0;
-    float swipeAccumX = 0.0f;
     bool cursorIsHidden = false;
 };
 
@@ -116,7 +116,7 @@ static void centerView() {
     g_app.ui.showToast("View Centered");
 }
 
-static void zoomAtCursor(float factor) {
+static void zoomAtPoint(float factor, float cursorX, float cursorY) {
     if ((!g_app.currentImage.isLoaded && g_app.currentImage.width <= 0) || g_app.ui.isGridView) return;
 
     float oldTargetScale = g_app.targetScale;
@@ -135,12 +135,34 @@ static void zoomAtCursor(float factor) {
         return;
     }
 
-    float cursorX = (float)g_app.mouseX;
-    float cursorY = (float)g_app.mouseY;
-
     g_app.targetPosX = cursorX - (cursorX - g_app.targetPosX) * (newTargetScale / oldTargetScale);
     g_app.targetPosY = cursorY - (cursorY - g_app.targetPosY) * (newTargetScale / oldTargetScale);
     g_app.targetScale = newTargetScale;
+}
+
+static void zoomAtCursor(float factor) {
+    zoomAtPoint(factor, (float)g_app.mouseX, (float)g_app.mouseY);
+}
+
+static double g_lastNativePinchScale = 1.0;
+static double g_horizontalSlideAccum = 0.0;
+static double g_lastHorizontalSlideAt = 0.0;
+static bool g_horizontalSlideTriggered = false;
+
+static void pinchCallback(GLFWwindow*, int phase, double scale,
+                          double centerX, double centerY, int fingers) {
+    if (fingers < 2) return;
+    g_app.redrawPending = true;
+    g_app.ui.notifyUserActivity();
+    if (phase == GLFW_PINCH_BEGIN) {
+        g_lastNativePinchScale = 1.0;
+        return;
+    }
+    if (phase == GLFW_PINCH_UPDATE && scale > 0.0) {
+        float factor = (float)(scale / g_lastNativePinchScale);
+        g_lastNativePinchScale = scale;
+        zoomAtPoint(factor, (float)centerX, (float)centerY);
+    }
 }
 
 static void panToMinimapNorm(float normX, float normY) {
@@ -197,16 +219,15 @@ static void loadCurrentFile() {
     // 1. Fast Header Probe: Instant image dimensions, layout & fitting in microseconds!
     // This guarantees window resizing, zooming, and smooth interaction work immediately
     // even while the high-resolution pixel buffer is decoding in the background!
+    // Release the old GPU texture before probeHeader replaces its path and
+    // dimensions.  The thumbnail below gives us an immediate progressive
+    // preview without ever presenting stale pixels as the new image.
+    if (g_app.currentImage.meta.filePath != path) g_app.currentImage.unload();
     g_app.currentImage.probeHeader(path);
-    // A file change is a cut, not a zoom gesture. Snap the transform to the new
-    // image so navigation remains visually stable even across very different
-    // aspect ratios and resolutions.
-    g_app.targetRotation = g_app.rotation = 0.0f;
-    g_app.rotationVel = 0.0f;
+    // A new image is a content swap, not a zoom gesture.  Snap the viewport to
+    // its new fit geometry so different aspect ratios do not animate through a
+    // distracting scale-up/scale-down pulse while paging quickly.
     fitToWindow(true);
-    g_app.scaleVel = 0.0f;
-    g_app.posVelX = 0.0f;
-    g_app.posVelY = 0.0f;
 
     // Update window title immediately
     char titleBuf[512];
@@ -267,10 +288,23 @@ static void toggleFullscreen() {
 // -----------------------------------------------------------------------------
 
 static void syncPixelScale() {
-    if (g_app.windowW <= 0) return;
-    float scale = (float)g_app.fbW / (float)g_app.windowW;
+    if (g_app.windowW <= 0 || g_app.windowH <= 0) return;
+    float scaleX = (float)g_app.fbW / (float)g_app.windowW;
+    float scaleY = (float)g_app.fbH / (float)g_app.windowH;
+    float scale = std::max(scaleX, scaleY);
     g_app.ui.font.setPixelScale(scale);
     g_app.ui.iconAtlas.setPixelScale(scale);
+    g_app.ui.thumbs.setPixelScale(scale);
+}
+
+static void contentScaleCallback(GLFWwindow* window, float, float) {
+    glfwGetWindowSize(window, &g_app.windowW, &g_app.windowH);
+    glfwGetFramebufferSize(window, &g_app.fbW, &g_app.fbH);
+    glViewport(0, 0, g_app.fbW, g_app.fbH);
+    g_app.ui.font.invalidateViewport();
+    syncPixelScale();
+    fitToWindow(true);
+    g_app.redrawPending = true;
 }
 
 static void framebufferSizeCallback(GLFWwindow* window, int w, int h) {
@@ -449,39 +483,48 @@ static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
         return;
     }
 
-    // 3. Pinch-to-zoom. GLFW does not expose a dedicated Wayland/X11 pinch
-    // callback; desktop touchpad stacks conventionally deliver pinch as
-    // Ctrl+scroll. Plain two-finger vertical scrolling must not zoom.
-    bool pinchGesture = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
-                        glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
-    if (pinchGesture && yoffset != 0.0) {
-        float factor = powf(1.08f, (float)yoffset);
-        zoomAtCursor(factor);
+    // GLFW combines mouse-wheel and touchpad axis events. Discrete wheel
+    // notches zoom at the pointer; fractional touchpad motion remains panning.
+    const SilverConfig& gestureCfg = SilverConfig::get();
+    double roundedY = std::round(yoffset);
+    double wheelTolerance = gestureCfg.num("gestures.wheelDiscreteTolerance", 0.08f);
+    bool discreteWheel = yoffset != 0.0 &&
+                         std::abs(yoffset - roundedY) <= wheelTolerance;
+    if (discreteWheel) {
+        float step = gestureCfg.num("viewer.wheelZoomStep", 0.14f);
+        zoomAtCursor(std::pow(1.0f + step, (float)yoffset));
         return;
     }
 
-    // Ordinary two-finger vertical movement pans a zoomed image vertically.
-    if (yoffset != 0.0 && g_app.targetScale > g_app.fitScale * 1.05f) {
-        g_app.targetPosY += (float)yoffset * 32.0f;
-    }
-
-    // 4. Two-Finger Horizontal Slide
-    // - If zoomed in: pans horizontally across image
-    // - If at fit view: swipes next / previous image
-    if (xoffset != 0.0) {
-        bool isZoomed = (g_app.targetScale > g_app.fitScale * 1.05f);
-        if (isZoomed) {
-            g_app.targetPosX += (float)xoffset * 32.0f;
-        } else {
-            g_app.swipeAccumX += (float)xoffset;
-            if (g_app.swipeAccumX > 3.0f) {
-                g_app.swipeAccumX = 0.0f;
-                if (g_app.folder.prev()) loadCurrentFile();
-            } else if (g_app.swipeAccumX < -3.0f) {
-                g_app.swipeAccumX = 0.0f;
-                if (g_app.folder.next()) loadCurrentFile();
+    // Native pinch owns touchpad zoom. Axis motion pans while enlarged.
+    bool isZoomed = (g_app.targetScale > g_app.fitScale * 1.05f);
+    if (isZoomed) {
+        float panSpeed = SilverConfig::get().num("gestures.panPixelsPerUnit", 32.0f);
+        if (xoffset != 0.0)
+            g_app.targetPosX += (float)xoffset * panSpeed;
+        if (yoffset != 0.0)
+            g_app.targetPosY += (float)yoffset * panSpeed;
+    } else if (xoffset != 0.0) {
+            const SilverConfig& cfg = SilverConfig::get();
+            double now = glfwGetTime();
+            if (g_lastHorizontalSlideAt > 0.0 &&
+                now - g_lastHorizontalSlideAt > cfg.num("gestures.slideResetSeconds", 0.18f)) {
+                g_horizontalSlideAccum = 0.0;
+                g_horizontalSlideTriggered = false;
             }
-        }
+            g_lastHorizontalSlideAt = now;
+            g_horizontalSlideAccum += xoffset;
+            double threshold = cfg.num("gestures.horizontalSlideThreshold", 4.0f);
+            if (!g_horizontalSlideTriggered && std::abs(g_horizontalSlideAccum) >= threshold) {
+                bool changed = g_horizontalSlideAccum > 0.0 ? g_app.folder.prev()
+                                                            : g_app.folder.next();
+                if (changed) loadCurrentFile();
+                g_horizontalSlideTriggered = true;
+            }
+    } else if (yoffset == 0.0) {
+        // Wayland emits a zero-valued frame when both touchpad axes stop.
+        g_horizontalSlideAccum = 0.0;
+        g_horizontalSlideTriggered = false;
     }
 }
 
@@ -738,7 +781,9 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_SAMPLES, 4);
+    int msaaSamples = std::clamp(SilverConfig::get().integer("display.msaaSamples", silver::defaults::msaaSamples),
+                                 0, silver::limits::maxMsaaSamples);
+    glfwWindowHint(GLFW_SAMPLES, msaaSamples);
 
     // Set Application ID & Class Context for Wayland & X11 (Prevents 'unknown' and ANR issues)
 #ifdef GLFW_WAYLAND_APP_ID
@@ -793,9 +838,11 @@ int main(int argc, char* argv[]) {
     // Register Callbacks
     glfwSetFramebufferSizeCallback(g_app.window, framebufferSizeCallback);
     glfwSetWindowSizeCallback(g_app.window, windowSizeCallback);
+    glfwSetWindowContentScaleCallback(g_app.window, contentScaleCallback);
     glfwSetCursorPosCallback(g_app.window, cursorPosCallback);
     glfwSetMouseButtonCallback(g_app.window, mouseButtonCallback);
     glfwSetScrollCallback(g_app.window, scrollCallback);
+    glfwSetPinchCallback(g_app.window, pinchCallback);
     glfwSetKeyCallback(g_app.window, keyCallback);
     glfwSetDropCallback(g_app.window, dropCallback);
 
@@ -810,6 +857,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to initialize FilePilot UI\n";
         return -1;
     }
+    if (msaaSamples > 0) glEnable(GL_MULTISAMPLE);
 
     // The viewer's filmstrip uses 60px tiles and does not need the gallery's
     // much larger texture pool. Mesa may mirror texture storage in process RSS,
@@ -908,29 +956,40 @@ int main(int argc, char* argv[]) {
         g_app.imageShader.drawBackground(g_app.windowW, g_app.windowH, activeBgMode, g_app.ui.theme.isDarkMode);
 
         // 2. Render Single Image (Full Res or Progressive Preview)
+        GLuint visibleTextureId = 0;
         if (!g_app.ui.isGridView) {
-            GLuint renderTexId = g_app.currentImage.id;
+            // probeHeader() updates dimensions before the async upload.  Do not
+            // stretch the previous image texture into those new dimensions.
+            bool currentTextureMatches = g_app.currentImage.id &&
+                g_app.currentImage.meta.filePath == g_app.folder.currentPath();
+            visibleTextureId = currentTextureMatches ? g_app.currentImage.id : 0;
 
             // If full resolution is still decoding in background, fall back to thumbnail texture
-            if (!renderTexId && g_app.folder.hasFiles()) {
+            if (!visibleTextureId && g_app.folder.hasFiles()) {
                 auto it = g_app.ui.thumbs.cache.find(g_app.folder.currentPath());
                 if (it != g_app.ui.thumbs.cache.end() && it->second.ready) {
-                    renderTexId = it->second.texId;
+                    visibleTextureId = it->second.texId;
                 }
             }
 
-            if (renderTexId) {
+            if (visibleTextureId) {
                 int curRotInt = ((int)(g_app.rotation + 0.5f) % 360 + 360) % 360;
                 float drawW = (float)(g_app.currentImage.width > 0 ? g_app.currentImage.width : 800);
                 float drawH = (float)(g_app.currentImage.height > 0 ? g_app.currentImage.height : 600);
 
+                // Align the image centre to the physical framebuffer grid.
+                // Sampling remains fractional for zoom, but a stable 1:1 view
+                // no longer softens because the whole quad sits half a pixel
+                // between samples.
+                float drawX = g_app.ui.font.snapToPixel(g_app.posX);
+                float drawY = g_app.ui.font.snapToPixel(g_app.posY);
                 g_app.imageShader.draw(
                     g_app.windowW, g_app.windowH,
-                    g_app.posX, g_app.posY,
+                    drawX, drawY,
                     drawW, drawH,
                     g_app.scale, curRotInt,
                     activeBgMode, g_app.pixelGrid,
-                    renderTexId
+                    visibleTextureId
                 );
             }
         }
@@ -949,9 +1008,8 @@ int main(int argc, char* argv[]) {
             g_app.posX, g_app.posY,
             curRotInt,
             g_app.nearestFilter, g_app.pixelGrid,
-            g_app.folder.hasFiles() &&
-                g_app.preloader.isLoadingPath(g_app.folder.currentPath()),
-            g_app.currentImage.id
+            g_app.preloader.isCurrentLoading.load(),
+            visibleTextureId
         );
         g_app.ui.font.endFrame();
 

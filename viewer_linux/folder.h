@@ -86,6 +86,7 @@ public:
         }
     }
 
+
     bool hasFiles() const {
         return !fileList.empty() && currentIndex >= 0 && currentIndex < (int)fileList.size();
     }

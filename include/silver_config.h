@@ -473,7 +473,20 @@ static const char* kSilverDefaultConfig = R"JSON({
     "prewarmWorkers": 0,
     "reservedWorkers": 2,
     "startupPrimeCount": 120,
-    "startupPrimeMillis": 900
+    "startupPrimeMillis": 900,
+    "//scopes": "Any key above can be overridden per application under a scope name.",
+    "viewer": {
+      "tiers": [96, 160, 256],
+      "maxResidentMegabytes": 64
+    },
+    "gallery": {
+    }
+  },
+
+  "library": {
+    "//roots": "Folders to index. Remove this key entirely to auto-detect (Pictures, Downloads, Documents, Desktop, Images, Photos, /usr/share/backgrounds). Supports ~ and $VAR. An empty list indexes nothing.",
+    "//exclude": "Folders to skip, including any nested inside a root. Supports ~ and $VAR.",
+    "exclude": []
   },
 
   "scanner": {
@@ -680,6 +693,20 @@ public:
             if (item.type == sjson::Value::NUM) out.push_back((int)std::lround(item.number));
         }
         return out.empty() ? fallback : out;
+    }
+
+    // An explicitly empty array is meaningful here (e.g. "no excluded folders"),
+    // so unlike intArray this does not fall back when the array is present but
+    // empty -- only when the key is missing or is not an array.
+    std::vector<std::string> stringArray(const char* path,
+                                         const std::vector<std::string>& fallback) const {
+        const sjson::Value* v = resolve(path);
+        if (!v || v->type != sjson::Value::ARR) return fallback;
+        std::vector<std::string> out;
+        for (const auto& item : v->items) {
+            if (item.type == sjson::Value::STR) out.push_back(item.text);
+        }
+        return out;
     }
 
 private:

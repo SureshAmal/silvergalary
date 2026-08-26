@@ -133,7 +133,7 @@
   "animation": {
     "//": "enabled:false makes every transition instant.",
     "enabled": true,
-    "speedMultiplier": 2.35,
+    "speedMultiplier": 2.45,
     "regroupStartScale": 0.88,
     "regroupEnterOffset": 24,
     "regroupMaxSizeRatio": 1.18,
@@ -255,7 +255,18 @@
     "prewarmWorkers": 0,
     "reservedWorkers": 2,
     "startupPrimeCount": 120,
-    "startupPrimeMillis": 900
+    "startupPrimeMillis": 900,
+    "//scopes": "Any key above can be overridden per application. The gallery grid reaches 440pt tiles and needs the big tiers; the viewer never draws above its 150pt grid, so it caps at 256 and uses a quarter of the memory.",
+    "viewer": {
+      "tiers": [96, 160, 256],
+      "maxResidentMegabytes": 64
+    },
+    "gallery": {}
+  },
+  "library": {
+    "//roots": "Folders to index. Remove this key entirely to auto-detect (Pictures, Downloads, Documents, Desktop, Images, Photos, /usr/share/backgrounds). Supports ~ and $VAR. An empty list indexes nothing.",
+    "//exclude": "Folders to skip, including any nested inside a root. Supports ~ and $VAR.",
+    "exclude": []
   },
   "scanner": {
     "batchSize": 450,

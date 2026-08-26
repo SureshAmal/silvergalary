@@ -1,6 +1,11 @@
 #pragma once
 
 #include "db.h"
+#include <cctype>
+#ifndef _WIN32
+#include <unistd.h>
+#include <pwd.h>
+#endif
 #include <filesystem>
 #include <thread>
 #include <atomic>
@@ -45,23 +50,103 @@ public:
     std::mutex statusMutex;
 
     std::vector<std::string> searchRoots;
+    std::vector<std::string> excludedRoots;
     std::thread workerThread;
 
     std::function<void()> onScanComplete;
 
-    GalleryScanner() {
+    // Roots are resolved lazily, not in the constructor: the gallery's app object
+    // is a namespace-scope static, so it is constructed before main() calls
+    // SilverConfig::init(). Reading config here would always miss library.roots.
+    bool rootsResolved = false;
+
+    GalleryScanner() = default;
+
+    void ensureRoots() {
+        if (rootsResolved) return;
         discoverDefaultRoots();
+        rootsResolved = true;
     }
 
     ~GalleryScanner() {
         stop();
     }
 
-    void discoverDefaultRoots() {
-        searchRoots.clear();
+    // Expand a leading "~" and any $VAR / ${VAR} so config paths stay portable
+    // across machines instead of hardcoding one user's home directory.
+    static std::string expandPath(const std::string& in) {
+        std::string out;
+        out.reserve(in.size());
+        for (size_t i = 0; i < in.size(); ++i) {
+            if (i == 0 && in[i] == '~' && (in.size() == 1 || in[1] == '/' || in[1] == '\\')) {
+                out += homeDirectory();
+                continue;
+            }
+            if (in[i] == '$' && i + 1 < in.size()) {
+                size_t start = i + 1;
+                bool braced = in[start] == '{';
+                if (braced) ++start;
+                size_t end = start;
+                while (end < in.size() &&
+                       (isalnum((unsigned char)in[end]) || in[end] == '_')) ++end;
+                std::string name = in.substr(start, end - start);
+                if (braced) {
+                    if (end < in.size() && in[end] == '}') ++end;
+                    else { out += in[i]; continue; }   // unterminated: leave as written
+                }
+                if (!name.empty()) {
+                    const char* val = getenv(name.c_str());
+                    if (val) out += val;
+                    i = end - 1;
+                    continue;
+                }
+            }
+            out += in[i];
+        }
+        return out;
+    }
+
+    static std::string homeDirectory() {
 #ifdef _WIN32
         const char* userProfile = getenv("USERPROFILE");
-        std::string homeStr = userProfile ? userProfile : "C:\\";
+        return userProfile ? userProfile : "C:\\";
+#else
+        const char* home = getenv("HOME");
+        if (home && *home) return home;
+        struct passwd* pw = getpwuid(getuid());
+        return pw && pw->pw_dir ? pw->pw_dir : "/home";
+#endif
+    }
+
+    void discoverDefaultRoots() {
+        rootsResolved = true;
+        searchRoots.clear();
+        excludedRoots.clear();
+
+        // Config wins when it lists roots; the platform defaults below are only
+        // used when the key is absent, so a user who sets "library.roots": []
+        // deliberately gets an empty library rather than a surprise rescan of $HOME.
+        const SilverConfig& cfg = SilverConfig::get();
+        const std::vector<std::string> sentinel = { "<unset>" };
+        std::vector<std::string> configured = cfg.stringArray("library.roots", sentinel);
+        for (const std::string& raw : cfg.stringArray("library.exclude", {})) {
+            std::string dir = expandPath(raw);
+            if (!dir.empty()) excludedRoots.push_back(normalizeDir(dir));
+        }
+
+        if (configured != sentinel) {
+            for (const std::string& raw : configured) {
+                std::string dir = expandPath(raw);
+                std::error_code ec;
+                if (!dir.empty() && fs::exists(dir, ec) && fs::is_directory(dir, ec))
+                    searchRoots.push_back(normalizeDir(dir));
+            }
+            dedupeRoots();
+            return;
+        }
+
+#ifdef _WIN32
+        std::string homeStr = homeDirectory();
         std::vector<std::string> candidates = {
             homeStr + "\\Pictures",
             homeStr + "\\Downloads",
@@ -71,12 +156,7 @@ public:
             homeStr + "\\OneDrive\\Pictures"
         };
 #else
-        const char* home = getenv("HOME");
-        if (!home) {
-            struct passwd* pw = getpwuid(getuid());
-            home = pw ? pw->pw_dir : "/home";
-        }
-        std::string homeStr(home);
+        std::string homeStr = homeDirectory();
 
         std::vector<std::string> candidates = {
             homeStr + "/Pictures",
@@ -92,22 +172,70 @@ public:
         for (const auto& dir : candidates) {
             std::error_code ec;
             if (fs::exists(dir, ec) && fs::is_directory(dir, ec)) {
-                searchRoots.push_back(dir);
+                searchRoots.push_back(normalizeDir(dir));
             }
         }
 
         if (searchRoots.empty()) {
-            searchRoots.push_back(homeStr);
+            searchRoots.push_back(normalizeDir(homeStr));
         }
+        dedupeRoots();
     }
 
-    void addCustomRoot(const std::string& dir) {
+    static std::string normalizeDir(const std::string& in) {
         std::error_code ec;
-        if (fs::exists(dir, ec) && fs::is_directory(dir, ec)) {
-            if (std::find(searchRoots.begin(), searchRoots.end(), dir) == searchRoots.end()) {
-                searchRoots.insert(searchRoots.begin(), dir);
+        fs::path p = fs::weakly_canonical(fs::path(in), ec);
+        std::string out = ec ? in : p.string();
+        while (out.size() > 1 && (out.back() == '/' || out.back() == '\\')) out.pop_back();
+        return out;
+    }
+
+    void dedupeRoots() {
+        // Order carries priority -- the first root is scanned first, and
+        // addCustomRoot puts the user's pick at the front -- so this must not
+        // sort. It keeps first occurrences and collapses ancestor/descendant
+        // pairs, since scanning both ~ and ~/Pictures would index twice.
+        std::vector<std::string> kept;
+        for (const std::string& dir : searchRoots) {
+            if (dir.empty() || isExcluded(dir)) continue;
+            bool covered = false;
+            for (const std::string& seen : kept) {
+                if (dir == seen || isUnder(dir, seen)) { covered = true; break; }
             }
+            if (covered) continue;
+            // This root contains ones already kept; they become redundant.
+            kept.erase(std::remove_if(kept.begin(), kept.end(),
+                                      [&](const std::string& seen) {
+                                          return isUnder(seen, dir);
+                                      }),
+                       kept.end());
+            kept.push_back(dir);
         }
+        searchRoots.swap(kept);
+    }
+
+    static bool isUnder(const std::string& path, const std::string& parent) {
+        if (path.size() <= parent.size()) return false;
+        if (path.compare(0, parent.size(), parent) != 0) return false;
+        return path[parent.size()] == '/' || path[parent.size()] == '\\';
+    }
+
+    bool isExcluded(const std::string& path) const {
+        for (const std::string& ex : excludedRoots) {
+            if (path == ex || isUnder(path, ex)) return true;
+        }
+        return false;
+    }
+
+    void addCustomRoot(const std::string& raw) {
+        ensureRoots();
+        std::string dir = normalizeDir(expandPath(raw));
+        std::error_code ec;
+        if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return;
+        if (isExcluded(dir)) return;
+        if (std::find(searchRoots.begin(), searchRoots.end(), dir) != searchRoots.end()) return;
+        searchRoots.insert(searchRoots.begin(), dir);
+        dedupeRoots();
     }
 
     static bool isSupportedExtension(const std::string& ext) {
@@ -124,6 +252,7 @@ public:
 
     void startScan(GalleryDatabase& db, bool async = true) {
         if (isScanning.load()) return;
+        ensureRoots();
         if (workerThread.joinable()) workerThread.join();
 
         if (async) {
@@ -253,7 +382,11 @@ private:
                         }
 
                         if (isDir) {
-                            if (!isSkippedDirectory(name)) subDirs.push_back(full);
+                            if (isSkippedDirectory(name)) continue;
+                            // Roots are normalized, so full is already canonical
+                            // enough for a prefix test; avoid a syscall per directory.
+                            if (!excludedRoots.empty() && isExcluded(full)) continue;
+                            subDirs.push_back(full);
                             continue;
                         }
                         if (!isFile) continue;

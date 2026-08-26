@@ -776,6 +776,7 @@ public:
     bool init(const char* fontPath = nullptr) {
         applyScale();
         theme.init();
+        thumbs.setConfigScope("viewer");
         thumbs.init();
         iconAtlas.init();
         return font.init(fontPath, 14.0f);   // whole pixels: FreeType rounds anyway

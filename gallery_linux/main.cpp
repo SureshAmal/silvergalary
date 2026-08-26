@@ -1076,6 +1076,9 @@ int main(int argc, char* argv[]) {
             if (SilverConfig::get().reloadIfChanged()) {
                 g_gal.ui.applyConfig();
                 g_gal.timeline.applyConfig();
+                // library.roots / library.exclude may have changed. Re-resolving
+                // is cheap; the next scan picks up the new set.
+                if (!g_gal.scanner.isScanning.load()) g_gal.scanner.discoverDefaultRoots();
                 float gridW = g_gal.ui.gridWidth((float)g_gal.windowW);
                 bool hasBanner = (!g_gal.ui.activeFolderFilter.empty() && g_gal.ui.currentTab != TAB_FOLDERS);
                 g_gal.timeline.relayout(gridW, hasBanner);

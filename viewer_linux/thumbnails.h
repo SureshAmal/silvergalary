@@ -106,6 +106,10 @@ public:
     int atlasColumns = 0;
     int atlasNextSlot = 0;
     std::vector<std::string> atlasOwners;
+    // Recency per slot. Without this, finding a victim meant a linear scan of
+    // the whole cache: on a tier change ~120 tiles each walked an 11k-entry map,
+    // about 1.3M iterations. The atlas has a few hundred slots at most.
+    std::vector<uint64_t> atlasSlotUsed;
     struct RetiredAtlas { GLuint texture = 0; size_t bytes = 0; };
     std::deque<RetiredAtlas> retiredAtlases;
     std::unordered_set<std::string> atlasVisiblePaths;
@@ -142,21 +146,70 @@ public:
     int maxPrewarmWorkers = 2;           // the rest stay free for on-screen tiles
     int prewarmEdge = 0;                 // tier the queue was built for
 
-    void applyConfig() {
-        const SilverConfig& c = SilverConfig::get();
-        maxResidentBytes = (size_t)std::max(32, c.integer("thumbnails.maxResidentMegabytes", 256))
-                           * 1024ull * 1024ull;
-        uploadsPerFrame     = std::max(1, c.integer("thumbnails.uploadsPerFrame", 32));
-        diskCacheQuality    = std::clamp(c.integer("thumbnails.diskCacheQuality", 85), 30, 100);
-        tierHeadroom        = std::max(1.0f, c.num("thumbnails.tierHeadroom", 1.35f));
-        tiers               = c.intArray("thumbnails.tiers", { 96, 160, 256, 384, 512 });
-        std::sort(tiers.begin(), tiers.end());
+    // Per-app config scope. The gallery and the viewer share one config file but
+    // have very different working sets: the gallery grid goes up to 440pt tiles,
+    // while the viewer only ever shows a 60px filmstrip and a 150px grid. Any key
+    // under "thumbnails.<scope>" overrides the shared "thumbnails.<key>", so the
+    // difference stays in the config rather than in code.
+    std::string configScope;
+    void setConfigScope(std::string scope) { configScope = std::move(scope); }
 
-        int configuredMaster = c.integer("thumbnails.masterTier", 0);
-        masterTier = (configuredMaster > 0) ? configuredMaster
-                                            : (tiers.empty() ? 512 : tiers.back());
-        if (!c.flag("thumbnails.diskCache", true)) diskCacheEnabled = false;
-        useSharedCache = c.flag("thumbnails.useSharedCache", true);
+    std::string sharedKey(const char* key) const { return std::string("thumbnails.") + key; }
+    std::string scopedKey(const char* key) const {
+        return "thumbnails." + configScope + "." + key;
+    }
+
+    int scopedInt(const char* key, int fallback) const {
+        const SilverConfig& c = SilverConfig::get();
+        int shared = c.integer(sharedKey(key).c_str(), fallback);
+        return configScope.empty() ? shared : c.integer(scopedKey(key).c_str(), shared);
+    }
+    float scopedNum(const char* key, float fallback) const {
+        const SilverConfig& c = SilverConfig::get();
+        float shared = c.num(sharedKey(key).c_str(), fallback);
+        return configScope.empty() ? shared : c.num(scopedKey(key).c_str(), shared);
+    }
+    bool scopedFlag(const char* key, bool fallback) const {
+        const SilverConfig& c = SilverConfig::get();
+        bool shared = c.flag(sharedKey(key).c_str(), fallback);
+        return configScope.empty() ? shared : c.flag(scopedKey(key).c_str(), shared);
+    }
+    std::vector<int> scopedIntArray(const char* key, const std::vector<int>& fallback) const {
+        const SilverConfig& c = SilverConfig::get();
+        std::vector<int> shared = c.intArray(sharedKey(key).c_str(), fallback);
+        return configScope.empty() ? shared : c.intArray(scopedKey(key).c_str(), shared);
+    }
+
+    void applyConfig() {
+        maxResidentBytes = (size_t)std::max(32, scopedInt("maxResidentMegabytes", 256))
+                           * 1024ull * 1024ull;
+        uploadsPerFrame     = std::max(1, scopedInt("uploadsPerFrame", 32));
+        diskCacheQuality    = std::clamp(scopedInt("diskCacheQuality", 85), 30, 100);
+        tierHeadroom        = std::max(1.0f, scopedNum("tierHeadroom", 1.35f));
+        tiers               = scopedIntArray("tiers", tiers);
+        std::sort(tiers.begin(), tiers.end());
+        tiers.erase(std::unique(tiers.begin(), tiers.end()), tiers.end());
+        tiers.erase(std::remove_if(tiers.begin(), tiers.end(),
+                                   [](int t) { return t <= 0; }), tiers.end());
+        if (tiers.empty()) tiers = { silver::defaults::thumbnailEdge };
+
+        // masterTier caps both cache size and quality: every smaller tier is
+        // derived from it. Tiers above the master would upscale, so drop them
+        // rather than raising the master and quietly ignoring the memory cap.
+        int configuredMaster = scopedInt("masterTier", 0);
+        if (configuredMaster > 0) {
+            masterTier = configuredMaster;
+            tiers.erase(std::remove_if(tiers.begin(), tiers.end(),
+                                       [&](int t) { return t > masterTier; }),
+                        tiers.end());
+            if (tiers.empty()) tiers = { masterTier };
+            else if (tiers.back() < masterTier) tiers.push_back(masterTier);
+        } else {
+            masterTier = tiers.back();
+        }
+
+        if (!scopedFlag("diskCache", true)) diskCacheEnabled = false;
+        useSharedCache = scopedFlag("useSharedCache", true);
     }
 
     void setPixelScale(float scale) {
@@ -523,6 +576,7 @@ public:
         atlasColumns = std::max(1, atlasSize / edge);
         atlasNextSlot = 0;
         atlasOwners.assign((size_t)atlasColumns * atlasColumns, {});
+        atlasSlotUsed.assign((size_t)atlasColumns * atlasColumns, 0);
         atlasEdge = edge;
 
         glGenTextures(1, &atlasTexture);
@@ -544,20 +598,29 @@ public:
         const int capacity = atlasColumns * atlasColumns;
         if (atlasNextSlot < capacity) return atlasNextSlot++;
 
-        auto victim = cache.end();
-        for (auto it = cache.begin(); it != cache.end(); ++it) {
-            if (it->second.texId != atlasTexture || it->second.atlasSlot < 0 ||
-                frameCounter - it->second.lastUsedFrame < 3) continue;
-            if (victim == cache.end() ||
-                it->second.lastUsedFrame < victim->second.lastUsedFrame) victim = it;
+        // Walk the slots, not the cache.
+        int victimSlot = -1;
+        uint64_t oldest = 0;
+        for (int slot = 0; slot < capacity; ++slot) {
+            if (atlasOwners[(size_t)slot].empty()) { victimSlot = slot; break; }
+            uint64_t used = atlasSlotUsed[(size_t)slot];
+            if (frameCounter - used < 3) continue;   // drawn very recently
+            if (victimSlot < 0 || used < oldest) { victimSlot = slot; oldest = used; }
         }
-        if (victim == cache.end()) return -1;
-        int slot = victim->second.atlasSlot;
-        victim->second.texId = 0;
-        victim->second.atlasSlot = -1;
-        victim->second.ready = false;
-        atlasOwners[(size_t)slot].clear();
-        return slot;
+        if (victimSlot < 0) return -1;
+
+        // Detach whoever held it.
+        const std::string& owner = atlasOwners[(size_t)victimSlot];
+        if (!owner.empty()) {
+            auto it = cache.find(owner);
+            if (it != cache.end() && it->second.atlasSlot == victimSlot) {
+                it->second.texId = 0;
+                it->second.atlasSlot = -1;
+                it->second.ready = false;
+            }
+        }
+        atlasOwners[(size_t)victimSlot].clear();
+        return victimSlot;
     }
 
     // Snap to one of the configured tiers so zooming reuses decoded textures
@@ -915,6 +978,7 @@ public:
                 item.atlasU1 = (cellX + dt.w - 0.5f) / (float)atlasSize;
                 item.atlasV1 = (cellY + dt.h - 0.5f) / (float)atlasSize;
                 atlasOwners[(size_t)slot] = dt.path;
+                atlasSlotUsed[(size_t)slot] = frameCounter;
             } else {
                 GLuint tid = 0;
                 glGenTextures(1, &tid);
@@ -963,7 +1027,11 @@ public:
     // Mark a thumbnail as drawn this frame (keeps it out of the eviction pool).
     void touch(const std::string& path) {
         auto it = cache.find(path);
-        if (it != cache.end()) it->second.lastUsedFrame = frameCounter;
+        if (it == cache.end()) return;
+        it->second.lastUsedFrame = frameCounter;
+        if (it->second.atlasSlot >= 0 && it->second.atlasSlot < (int)atlasSlotUsed.size()) {
+            atlasSlotUsed[(size_t)it->second.atlasSlot] = frameCounter;
+        }
     }
 
     // Box-average the decoded thumbnail down to 8x8 RGB. Costs almost nothing

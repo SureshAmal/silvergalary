@@ -631,6 +631,7 @@ public:
         applyConfig();
         theme.init();
         thumbs.setAtlasEnabled(true);
+        thumbs.setConfigScope("gallery");
         thumbs.init();
         fullResLoader.init();
     }

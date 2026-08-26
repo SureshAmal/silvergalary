@@ -644,6 +644,10 @@ public:
             auto preloaded = fullResLoader.getIfReady(selectedPath);
             if (preloaded && preloaded->data && (!highResPreview.id || highResPreview.meta.filePath != selectedPath)) {
                 highResPreview.uploadPixels(preloaded->data, preloaded->width, preloaded->height, preloaded->meta);
+                fullResLoader.discardUploadedPixels(selectedPath);
+#ifndef _WIN32
+                malloc_trim(0);
+#endif
             }
         }
 
@@ -897,7 +901,6 @@ public:
         showSidebar = true;
         timeline.selectItem(rec.path);
         thumbs.requestThumbnail(rec.path, true);
-        fullResLoader.requestPrimaryImage(rec.path);
 
         if (windowH > 0.0f && timeline.selectedFlatIndex >= 0 && timeline.selectedFlatIndex < (int)timeline.flatAllItems.size()) {
             const auto* itm = timeline.flatAllItems[timeline.selectedFlatIndex];
@@ -919,14 +922,12 @@ public:
         fullResLoader.requestPrimaryImage(selectedPath);
 
         std::vector<std::string> nearby;
-        nearby.reserve(7);
+        nearby.reserve(3);
         nearby.push_back(selectedPath);
-        for (int distance = 1; distance <= 3; ++distance) {
-            if (index + distance < (int)records.size())
-                nearby.push_back(records[(size_t)(index + distance)].path);
-            if (index - distance >= 0)
-                nearby.push_back(records[(size_t)(index - distance)].path);
-        }
+        if (index + 1 < (int)records.size())
+            nearby.push_back(records[(size_t)(index + 1)].path);
+        if (index - 1 >= 0)
+            nearby.push_back(records[(size_t)(index - 1)].path);
         fullResLoader.updatePreloadPaths(nearby);
     }
 
@@ -1554,11 +1555,13 @@ public:
                 font.render(windowW, windowH);
 
                 font.beginBatch();
-                iconAtlas.drawIcon(font, ICON_ARROW_LEFT, breadcrumbClearRect.x + 8.0f, breadcrumbClearRect.y + 8.0f, 14.0f, 14.0f, pal.accent);
+                float bcIconS = 14.0f * L.uiScale;
+                iconAtlas.drawIcon(font, ICON_ARROW_LEFT, breadcrumbClearRect.x + 8.0f * L.uiScale,
+                                   breadcrumbClearRect.y + (breadcrumbClearRect.h - bcIconS) * 0.5f, bcIconS, bcIconS, pal.accent);
                 font.render(windowW, windowH, 0, iconAtlas.textureId);
 
                 font.beginBatch();
-                font.addTextVCentered(breadcrumbClearRect.x + 26.0f, breadcrumbClearRect.y, breadcrumbClearRect.h,
+                font.addTextVCentered(breadcrumbClearRect.x + 26.0f * L.uiScale, breadcrumbClearRect.y, breadcrumbClearRect.h,
                                       "Back to Folders", pal.accent);
                 font.render(windowW, windowH);
             }
@@ -2039,9 +2042,9 @@ public:
         font.render(windowW, windowH);
 
         // 1. Right Controls (Scan / Rescan + Theme Toggle)
-        float rightMargin = 14.0f;
-        float btnSize = 32.0f;
-        float btnGap = 8.0f;
+        float rightMargin = 14.0f * L.uiScale;
+        float btnSize = 32.0f * L.uiScale;
+        float btnGap = 8.0f * L.uiScale;
         float ry = (topBarH - btnSize) * 0.5f;
 
         themeBtnRect.x = (float)windowW - rightMargin - btnSize;
@@ -2058,28 +2061,31 @@ public:
         themeBtnRect.isHovered = isInside(mouseX, mouseY, themeBtnRect.x, themeBtnRect.y, btnSize, btnSize);
 
         font.beginBatch();
-        if (scanBtnRect.isHovered) font.addRoundedRect(scanBtnRect.x, scanBtnRect.y, btnSize, btnSize, 6.0f, pal.btnHover);
-        if (showThemeMenu || themeBtnRect.isHovered) font.addRoundedRect(themeBtnRect.x, themeBtnRect.y, btnSize, btnSize, 6.0f, showThemeMenu ? pal.accent : pal.btnHover);
+        if (scanBtnRect.isHovered) font.addRoundedRect(scanBtnRect.x, scanBtnRect.y, btnSize, btnSize, 6.0f * L.uiScale, pal.btnHover);
+        if (showThemeMenu || themeBtnRect.isHovered) font.addRoundedRect(themeBtnRect.x, themeBtnRect.y, btnSize, btnSize, 6.0f * L.uiScale, showThemeMenu ? pal.accent : pal.btnHover);
         font.render(windowW, windowH);
 
         font.beginBatch();
-        iconAtlas.drawIcon(font, ICON_REFRESH, scanBtnRect.x + 6, scanBtnRect.y + 6, 20, 20,
+        float topIconS = 20.0f * L.uiScale;
+        float topIconPad = (btnSize - topIconS) * 0.5f;
+        iconAtlas.drawIcon(font, ICON_REFRESH, scanBtnRect.x + topIconPad, scanBtnRect.y + topIconPad, topIconS, topIconS,
                            scanner.isScanning.load() ? pal.accent : pal.textPrimary);
         iconAtlas.drawIcon(font, theme.isDarkMode.load() ? ICON_THEME_LIGHT : ICON_THEME_DARK,
-                           themeBtnRect.x + 6, themeBtnRect.y + 6, 20, 20, showThemeMenu ? Color4(1, 1, 1, 1) : pal.textPrimary);
+                           themeBtnRect.x + topIconPad, themeBtnRect.y + topIconPad, topIconS, topIconS, showThemeMenu ? Color4(1, 1, 1, 1) : pal.textPrimary);
         font.render(windowW, windowH, 0, iconAtlas.textureId);
 
         // 2. Left App Logo & Title (Responsive)
         font.beginBatch();
-        iconAtlas.drawIcon(font, ICON_PHOTO, 16.0f, 16.0f, 28.0f, 28.0f, pal.accent);
+        float logoS = 28.0f * L.uiScale;
+        iconAtlas.drawIcon(font, ICON_PHOTO, 16.0f * L.uiScale, (topBarH - logoS) * 0.5f, logoS, logoS, pal.accent);
         font.render(windowW, windowH, 0, iconAtlas.textureId);
 
-        float leftBoundary = 52.0f;
+        float leftBoundary = 52.0f * L.uiScale;
         if (windowW >= 720) {
             font.beginBatch();
-            font.addText(52.0f, 20.0f, "SilverGallery", pal.textPrimary);
+            font.addTextVCentered(52.0f * L.uiScale, 0.0f, topBarH, "SilverGallery", pal.textPrimary);
             font.render(windowW, windowH);
-            leftBoundary = 52.0f + font.measureText("SilverGallery") + 18.0f;
+            leftBoundary = 52.0f * L.uiScale + font.measureText("SilverGallery") + 18.0f * L.uiScale;
         }
 
         // 3. Center Filter Tabs (Responsive Segmented Control Pill)
@@ -2632,7 +2638,8 @@ public:
                 Color4 iconCol = isActive ? Color4(1, 1, 1, tmAlpha)
                                           : fade(to.rect->isHovered ? pal.textPrimary : pal.textSecondary, tmAlpha);
                 font.beginBatch();
-                iconAtlas.drawIcon(font, to.icon, optX + 8.0f, optY + 7.0f, 18.0f, 18.0f, iconCol);
+                float optIconS = 18.0f * L.uiScale;
+                iconAtlas.drawIcon(font, to.icon, optX + 8.0f * L.uiScale, optY + (optH - optIconS) * 0.5f, optIconS, optIconS, iconCol);
                 font.render(windowW, windowH, 0, iconAtlas.textureId);
 
                 Color4 textCol = isActive ? Color4(1, 1, 1, tmAlpha) : fade(pal.textPrimary, tmAlpha);
@@ -3189,7 +3196,7 @@ public:
         float innerW = L.sidebarWidth - L.sidebarInnerPad * 2.0f;
 
         // 1. Header: Title & Polished Close Button
-        float btnCloseSize = 28.0f;
+        float btnCloseSize = 28.0f * L.uiScale;
         sbCloseRect.x = sbX + L.sidebarWidth - btnCloseSize - L.sidebarInnerPad;
         sbCloseRect.y = curY;
         sbCloseRect.w = btnCloseSize;
@@ -3199,12 +3206,17 @@ public:
         font.beginBatch();
         font.addTextVCentered(innerX, curY, btnCloseSize, "Preview & Info", pal.textPrimary);
         // Styled rounded close button pill
-        font.addRoundedRect(sbCloseRect.x, sbCloseRect.y, btnCloseSize, btnCloseSize, 6.0f, sbCloseRect.isHovered ? pal.btnHover : pal.btnBg);
-        font.addRoundedBorder(sbCloseRect.x, sbCloseRect.y, btnCloseSize, btnCloseSize, 6.0f, 1.0f, sbCloseRect.isHovered ? pal.accent : pal.btnBorder);
+        font.addRoundedRect(sbCloseRect.x, sbCloseRect.y, btnCloseSize, btnCloseSize, 6.0f * L.uiScale, sbCloseRect.isHovered ? pal.btnHover : pal.btnBg);
+        font.addRoundedBorder(sbCloseRect.x, sbCloseRect.y, btnCloseSize, btnCloseSize, 6.0f * L.uiScale, 1.0f, sbCloseRect.isHovered ? pal.accent : pal.btnBorder);
         font.render(windowW, windowH);
 
         font.beginBatch();
-        iconAtlas.drawIcon(font, ICON_CLOSE, sbCloseRect.x + 7.0f, sbCloseRect.y + 7.0f, 14.0f, 14.0f, sbCloseRect.isHovered ? pal.textPrimary : pal.textSecondary);
+        float sbCloseIconS = 14.0f * L.uiScale;
+        iconAtlas.drawIcon(font, ICON_CLOSE,
+                           sbCloseRect.x + (btnCloseSize - sbCloseIconS) * 0.5f,
+                           sbCloseRect.y + (btnCloseSize - sbCloseIconS) * 0.5f,
+                           sbCloseIconS, sbCloseIconS,
+                           sbCloseRect.isHovered ? pal.textPrimary : pal.textSecondary);
         font.render(windowW, windowH, 0, iconAtlas.textureId);
 
         curY += 38.0f;
@@ -3489,20 +3501,22 @@ public:
         }
 
         // Copy Full Path Button
-        sbCopyPathRect.x = innerX; sbCopyPathRect.y = curY; sbCopyPathRect.w = innerW; sbCopyPathRect.h = 32.0f;
-        sbCopyPathRect.isHovered = isInside(mouseX, mouseY, innerX, curY, innerW, 32.0f);
+        float btnCopyH = 32.0f * L.uiScale;
+        sbCopyPathRect.x = innerX; sbCopyPathRect.y = curY; sbCopyPathRect.w = innerW; sbCopyPathRect.h = btnCopyH;
+        sbCopyPathRect.isHovered = isInside(mouseX, mouseY, innerX, curY, innerW, btnCopyH);
 
         font.beginBatch();
-        font.addRoundedRect(innerX, curY, innerW, 32.0f, 6.0f, sbCopyPathRect.isHovered ? pal.btnHover : pal.cardBg);
-        font.addRoundedBorder(innerX, curY, innerW, 32.0f, 6.0f, 1.0f, pal.cardBorder);
+        font.addRoundedRect(innerX, curY, innerW, btnCopyH, 6.0f * L.uiScale, sbCopyPathRect.isHovered ? pal.btnHover : pal.cardBg);
+        font.addRoundedBorder(innerX, curY, innerW, btnCopyH, 6.0f * L.uiScale, 1.0f, pal.cardBorder);
         font.render(windowW, windowH);
 
         font.beginBatch();
-        iconAtlas.drawIcon(font, ICON_COPY, innerX + 12.0f, curY + 8.0f, 16.0f, 16.0f, pal.accent);
+        float copyIconS = 16.0f * L.uiScale;
+        iconAtlas.drawIcon(font, ICON_COPY, innerX + 12.0f * L.uiScale, curY + (btnCopyH - copyIconS) * 0.5f, copyIconS, copyIconS, pal.accent);
         font.render(windowW, windowH, 0, iconAtlas.textureId);
 
         font.beginBatch();
-        font.addTextVCentered(innerX + 34.0f, curY, 32.0f, "Copy Full File Path", pal.accent);
+        font.addTextVCentered(innerX + 34.0f * L.uiScale, curY, btnCopyH, "Copy Full File Path", pal.accent);
         font.render(windowW, windowH);
     }
 
@@ -3607,37 +3621,42 @@ public:
 
         // 3. Navigation Arrows (< and >)
         float arrowSize = L.fsArrowSize;
-        fsPrevBtnRect.x = 16.0f;
+        fsPrevBtnRect.x = 16.0f * L.uiScale;
         fsPrevBtnRect.y = topBarH + (viewH - arrowSize) * 0.5f;
         fsPrevBtnRect.w = arrowSize;
         fsPrevBtnRect.h = arrowSize;
         fsPrevBtnRect.isHovered = isInside(mouseX, mouseY, fsPrevBtnRect.x, fsPrevBtnRect.y, arrowSize, arrowSize);
 
-        fsNextBtnRect.x = (float)windowW - arrowSize - 16.0f;
+        fsNextBtnRect.x = (float)windowW - arrowSize - 16.0f * L.uiScale;
         fsNextBtnRect.y = topBarH + (viewH - arrowSize) * 0.5f;
         fsNextBtnRect.w = arrowSize;
         fsNextBtnRect.h = arrowSize;
         fsNextBtnRect.isHovered = isInside(mouseX, mouseY, fsNextBtnRect.x, fsNextBtnRect.y, arrowSize, arrowSize);
 
+        float arrowIconSize = arrowSize * 0.5f;
+        float arrowIconPad = (arrowSize - arrowIconSize) * 0.5f;
+
         if (fullScreenIndex > 0) {
             font.beginBatch();
-            font.addRoundedRect(fsPrevBtnRect.x, fsPrevBtnRect.y, arrowSize, arrowSize, 24.0f,
+            font.addRoundedRect(fsPrevBtnRect.x, fsPrevBtnRect.y, arrowSize, arrowSize, arrowSize * 0.5f,
                                 fsPrevBtnRect.isHovered ? pal.btnHover : Color4(0, 0, 0, 0.45f * anim));
             font.render(windowW, windowH);
 
             font.beginBatch();
-            iconAtlas.drawIcon(font, ICON_CHEVRON_LEFT, fsPrevBtnRect.x + 12.0f, fsPrevBtnRect.y + 12.0f, 24.0f, 24.0f, Color4(1, 1, 1, anim));
+            iconAtlas.drawIcon(font, ICON_CHEVRON_LEFT, fsPrevBtnRect.x + arrowIconPad, fsPrevBtnRect.y + arrowIconPad,
+                               arrowIconSize, arrowIconSize, Color4(1, 1, 1, anim));
             font.render(windowW, windowH, 0, iconAtlas.textureId);
         }
 
         if (fullScreenIndex + 1 < (int)records.size()) {
             font.beginBatch();
-            font.addRoundedRect(fsNextBtnRect.x, fsNextBtnRect.y, arrowSize, arrowSize, 24.0f,
+            font.addRoundedRect(fsNextBtnRect.x, fsNextBtnRect.y, arrowSize, arrowSize, arrowSize * 0.5f,
                                 fsNextBtnRect.isHovered ? pal.btnHover : Color4(0, 0, 0, 0.45f * anim));
             font.render(windowW, windowH);
 
             font.beginBatch();
-            iconAtlas.drawIcon(font, ICON_CHEVRON_RIGHT, fsNextBtnRect.x + 12.0f, fsNextBtnRect.y + 12.0f, 24.0f, 24.0f, Color4(1, 1, 1, anim));
+            iconAtlas.drawIcon(font, ICON_CHEVRON_RIGHT, fsNextBtnRect.x + arrowIconPad, fsNextBtnRect.y + arrowIconPad,
+                               arrowIconSize, arrowIconSize, Color4(1, 1, 1, anim));
             font.render(windowW, windowH, 0, iconAtlas.textureId);
         }
 
@@ -3648,26 +3667,31 @@ public:
         font.render(windowW, windowH);
 
         // Mobile-Style "Back" Button
-        fsBackBtnRect.x = 16.0f;
-        fsBackBtnRect.y = 14.0f;
-        fsBackBtnRect.w = 90.0f;
-        fsBackBtnRect.h = 36.0f;
+        float fsBackH = 36.0f * L.uiScale;
+        float fsBackW = 90.0f * L.uiScale;
+        float fsBackY = (topBarH - fsBackH) * 0.5f;
+        fsBackBtnRect.x = 16.0f * L.uiScale;
+        fsBackBtnRect.y = fsBackY;
+        fsBackBtnRect.w = fsBackW;
+        fsBackBtnRect.h = fsBackH;
         fsBackBtnRect.isHovered = isInside(mouseX, mouseY, fsBackBtnRect.x, fsBackBtnRect.y, fsBackBtnRect.w, fsBackBtnRect.h);
 
         font.beginBatch();
-        font.addRoundedRect(fsBackBtnRect.x, fsBackBtnRect.y, fsBackBtnRect.w, fsBackBtnRect.h, 18.0f,
+        font.addRoundedRect(fsBackBtnRect.x, fsBackBtnRect.y, fsBackBtnRect.w, fsBackBtnRect.h, 6.0f * L.uiScale,
                             fade(fsBackBtnRect.isHovered ? pal.btnHover : pal.cardBg, anim));
-        font.addRoundedBorder(fsBackBtnRect.x, fsBackBtnRect.y, fsBackBtnRect.w, fsBackBtnRect.h, 18.0f, 1.0f,
+        font.addRoundedBorder(fsBackBtnRect.x, fsBackBtnRect.y, fsBackBtnRect.w, fsBackBtnRect.h, 6.0f * L.uiScale, 1.0f,
                               fade(pal.cardBorder, anim));
         font.render(windowW, windowH);
 
         font.beginBatch();
-        iconAtlas.drawIcon(font, ICON_ARROW_LEFT, fsBackBtnRect.x + 10.0f, fsBackBtnRect.y + 9.0f, 18.0f, 18.0f,
+        float backIconS = 18.0f * L.uiScale;
+        iconAtlas.drawIcon(font, ICON_ARROW_LEFT, fsBackBtnRect.x + 10.0f * L.uiScale,
+                           fsBackBtnRect.y + (fsBackBtnRect.h - backIconS) * 0.5f, backIconS, backIconS,
                            fade(pal.accent, anim));
         font.render(windowW, windowH, 0, iconAtlas.textureId);
 
         font.beginBatch();
-        font.addTextVCentered(fsBackBtnRect.x + 34.0f, fsBackBtnRect.y, fsBackBtnRect.h, "Back", fade(pal.accent, anim));
+        font.addTextVCentered(fsBackBtnRect.x + 34.0f * L.uiScale, fsBackBtnRect.y, fsBackBtnRect.h, "Back", fade(pal.accent, anim));
         font.render(windowW, windowH);
 
         // Center Filename & Counter
@@ -3675,21 +3699,24 @@ public:
         char countBuf[64];
         snprintf(countBuf, sizeof(countBuf), "  [%d / %d]", fullScreenIndex + 1, (int)records.size());
         float countW = font.measureText(countBuf);
-        float maxNameW = std::max(60.0f, (float)windowW - 300.0f - countW);
+        float maxNameW = std::max(60.0f, (float)windowW - 300.0f * L.uiScale - countW);
         std::string fittedName = fitTextWithEllipsis(font, selectedRecord.filename, maxNameW);
         std::string fullHeader = fittedName + countBuf;
         float cw = font.measureText(fullHeader);
         float cx = ((float)windowW - cw) * 0.5f;
-        font.addText(cx, 22.0f, fullHeader, Color4(pal.textPrimary.r, pal.textPrimary.g, pal.textPrimary.b, anim));
+        font.addTextVCentered(cx, 0.0f, topBarH, fullHeader, Color4(pal.textPrimary.r, pal.textPrimary.g, pal.textPrimary.b, anim));
         font.render(windowW, windowH);
 
         // Right Controls: [Favorite] [Standalone Viewer] [Close]
         float btnS = L.fsButtonSize;
-        float fsRx = (float)windowW - (btnS * 3.0f + 8.0f * 2.0f + 16.0f);
+        float btnGap = 8.0f * L.uiScale;
+        float rightPad = 16.0f * L.uiScale;
+        float fsRx = (float)windowW - (btnS * 3.0f + btnGap * 2.0f + rightPad);
+        float fsRy = (topBarH - btnS) * 0.5f;
 
-        fsFavBtnRect.x = fsRx; fsFavBtnRect.y = 14.0f; fsFavBtnRect.w = btnS; fsFavBtnRect.h = btnS;
-        fsViewerBtnRect.x = fsRx + btnS + 8.0f; fsViewerBtnRect.y = 14.0f; fsViewerBtnRect.w = btnS; fsViewerBtnRect.h = btnS;
-        fsCloseBtnRect.x = fsRx + (btnS + 8.0f) * 2.0f; fsCloseBtnRect.y = 14.0f; fsCloseBtnRect.w = btnS; fsCloseBtnRect.h = btnS;
+        fsFavBtnRect.x = fsRx; fsFavBtnRect.y = fsRy; fsFavBtnRect.w = btnS; fsFavBtnRect.h = btnS;
+        fsViewerBtnRect.x = fsRx + btnS + btnGap; fsViewerBtnRect.y = fsRy; fsViewerBtnRect.w = btnS; fsViewerBtnRect.h = btnS;
+        fsCloseBtnRect.x = fsRx + (btnS + btnGap) * 2.0f; fsCloseBtnRect.y = fsRy; fsCloseBtnRect.w = btnS; fsCloseBtnRect.h = btnS;
 
         fsFavBtnRect.isHovered = isInside(mouseX, mouseY, fsFavBtnRect.x, fsFavBtnRect.y, btnS, btnS);
         fsViewerBtnRect.isHovered = isInside(mouseX, mouseY, fsViewerBtnRect.x, fsViewerBtnRect.y, btnS, btnS);
@@ -3698,20 +3725,22 @@ public:
         font.beginBatch();
         Color4 fsFavBg = fade(selectedRecord.starred ? Color4::Hex(0xEF4444, 0.9f)
                                                      : (fsFavBtnRect.isHovered ? pal.btnHover : pal.cardBg), anim);
-        font.addRoundedRect(fsFavBtnRect.x, fsFavBtnRect.y, btnS, btnS, 8.0f, fsFavBg);
-        if (fsViewerBtnRect.isHovered) font.addRoundedRect(fsViewerBtnRect.x, fsViewerBtnRect.y, btnS, btnS, 8.0f, fade(pal.btnHover, anim));
-        if (fsCloseBtnRect.isHovered) font.addRoundedRect(fsCloseBtnRect.x, fsCloseBtnRect.y, btnS, btnS, 8.0f, fade(pal.btnHover, anim));
+        font.addRoundedRect(fsFavBtnRect.x, fsFavBtnRect.y, btnS, btnS, 8.0f * L.uiScale, fsFavBg);
+        if (fsViewerBtnRect.isHovered) font.addRoundedRect(fsViewerBtnRect.x, fsViewerBtnRect.y, btnS, btnS, 8.0f * L.uiScale, fade(pal.btnHover, anim));
+        if (fsCloseBtnRect.isHovered) font.addRoundedRect(fsCloseBtnRect.x, fsCloseBtnRect.y, btnS, btnS, 8.0f * L.uiScale, fade(pal.btnHover, anim));
         font.render(windowW, windowH);
 
         font.beginBatch();
+        float fsIconS = std::min(btnS - 8.0f, 20.0f * L.uiScale);
+        float fsIconPad = (btnS - fsIconS) * 0.5f;
         iconAtlas.drawIcon(font, selectedRecord.starred ? ICON_HEART_FILLED : ICON_HEART,
-                           fsFavBtnRect.x + 8.0f, fsFavBtnRect.y + 8.0f, 20.0f, 20.0f,
+                           fsFavBtnRect.x + fsIconPad, fsFavBtnRect.y + fsIconPad, fsIconS, fsIconS,
                            selectedRecord.starred ? Color4(1, 1, 1, anim) : fade(pal.textPrimary, anim));
         iconAtlas.drawIcon(font, ICON_EXTERNAL_LINK,
-                           fsViewerBtnRect.x + 8.0f, fsViewerBtnRect.y + 8.0f, 20.0f, 20.0f,
+                           fsViewerBtnRect.x + fsIconPad, fsViewerBtnRect.y + fsIconPad, fsIconS, fsIconS,
                            fade(pal.textPrimary, anim));
         iconAtlas.drawIcon(font, ICON_CLOSE,
-                           fsCloseBtnRect.x + 8.0f, fsCloseBtnRect.y + 8.0f, 20.0f, 20.0f,
+                           fsCloseBtnRect.x + fsIconPad, fsCloseBtnRect.y + fsIconPad, fsIconS, fsIconS,
                            fade(pal.textSecondary, anim));
         font.render(windowW, windowH, 0, iconAtlas.textureId);
     }

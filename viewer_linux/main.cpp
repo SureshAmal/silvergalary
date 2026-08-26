@@ -9,6 +9,9 @@
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <malloc.h>
+#endif
 
 struct AppState {
     GLFWwindow* window = nullptr;
@@ -67,8 +70,9 @@ static AppState g_app;
 static void calculateFitParameters(float& outScale, float& outPosX, float& outPosY) {
     if (!g_app.currentImage.isLoaded && g_app.currentImage.width <= 0) return;
 
-    float availW = g_app.ui.presentationMode ? (float)g_app.windowW : ((float)g_app.windowW - 48.0f);
-    float availH = g_app.ui.presentationMode ? (float)g_app.windowH : ((float)g_app.windowH - g_app.ui.topBarH - (g_app.ui.showThumbnails ? g_app.ui.bottomStripH : 0.0f) - 32.0f);
+    float sidePanelReserve = g_app.ui.cropState.active ? (220.0f * g_app.ui.uiScale) : 0.0f;
+    float availW = g_app.ui.presentationMode ? (float)g_app.windowW : ((float)g_app.windowW - 48.0f - sidePanelReserve);
+    float availH = g_app.ui.presentationMode ? (float)g_app.windowH : ((float)g_app.windowH - g_app.ui.topBarH - (g_app.ui.cropState.active ? 32.0f : (g_app.ui.showThumbnails ? g_app.ui.bottomStripH : 0.0f)) - 32.0f);
     if (availW < 100.0f) availW = 100.0f;
     if (availH < 100.0f) availH = 100.0f;
 
@@ -76,6 +80,9 @@ static void calculateFitParameters(float& outScale, float& outPosX, float& outPo
     float imgH = (float)g_app.currentImage.height;
 
     int curRotInt = ((int)(g_app.targetRotation + 0.5f) % 360 + 360) % 360;
+    if (g_app.ui.cropState.active) {
+        curRotInt = (curRotInt + g_app.ui.cropState.rotation) % 360;
+    }
     if (curRotInt == 90 || curRotInt == 270) {
         std::swap(imgW, imgH);
     }
@@ -84,7 +91,7 @@ static void calculateFitParameters(float& outScale, float& outPosX, float& outPo
     float scaleY = availH / imgH;
     outScale = std::min(scaleX, scaleY);
 
-    outPosX = (float)g_app.windowW * 0.5f;
+    outPosX = g_app.ui.cropState.active ? (((float)g_app.windowW - sidePanelReserve) * 0.5f) : ((float)g_app.windowW * 0.5f);
     outPosY = g_app.ui.presentationMode ? ((float)g_app.windowH * 0.5f) : (g_app.ui.topBarH + availH * 0.5f + 16.0f);
 }
 
@@ -209,6 +216,10 @@ static void loadCurrentFile() {
     std::string path = g_app.folder.currentPath();
     g_app.ui.notifyUserActivity();
 
+    // Immediately snap/animate filmstrip centering to current item without waiting for async decode
+    g_app.ui.thumbs.centerOnIndex(g_app.folder.currentIndex, g_app.folder.count(),
+                                  (float)g_app.windowW, g_app.ui.thumbW, g_app.ui.thumbGap);
+
     // Never draw the previous photo using the next photo's dimensions. That
     // made rapid Left/Right navigation look like one image was repeatedly
     // growing and shrinking while decoding caught up. Drop the old GPU texture
@@ -219,10 +230,6 @@ static void loadCurrentFile() {
     // 1. Fast Header Probe: Instant image dimensions, layout & fitting in microseconds!
     // This guarantees window resizing, zooming, and smooth interaction work immediately
     // even while the high-resolution pixel buffer is decoding in the background!
-    // Release the old GPU texture before probeHeader replaces its path and
-    // dimensions.  The thumbnail below gives us an immediate progressive
-    // preview without ever presenting stale pixels as the new image.
-    if (g_app.currentImage.meta.filePath != path) g_app.currentImage.unload();
     g_app.currentImage.probeHeader(path);
     // A new image is a content swap, not a zoom gesture.  Snap the viewport to
     // its new fit geometry so different aspect ratios do not animate through a
@@ -256,6 +263,9 @@ static void loadCurrentFile() {
             g_app.currentImage.setFiltering(g_app.nearestFilter);
             applyLoadedImageMeta(preloaded->meta);
             g_app.preloader.discardUploadedPixels(path);
+#if defined(__linux__) && !defined(__ANDROID__)
+            malloc_trim(0);
+#endif
         }
     } else {
         // Asynchronous Large-Image Background Loader (Zero Main Thread Stalling!)
@@ -330,6 +340,19 @@ static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     g_app.mouseY = ypos;
     g_app.ui.notifyUserActivity();
 
+    if (g_app.ui.cropState.active) {
+        float qx, qy, qw, qh;
+        int totalRot = ((int)(g_app.targetRotation + 0.5f) + g_app.ui.cropState.rotation) % 360;
+        g_app.ui.getImageQuadBounds(g_app.windowW, g_app.windowH,
+                                    g_app.posX, g_app.posY,
+                                    (float)g_app.currentImage.width, (float)g_app.currentImage.height,
+                                    g_app.scale, totalRot,
+                                    qx, qy, qw, qh);
+        g_app.ui.handleCropMouseMove((float)xpos, (float)ypos, qx, qy, qw, qh,
+                                     g_app.currentImage.width, g_app.currentImage.height);
+        return;
+    }
+
     if (g_app.isDragging && !g_app.ui.isGridView && !g_app.ui.presentationMode) {
         float dx = (float)(xpos - g_app.dragStartX);
         float dy = (float)(ypos - g_app.dragStartY);
@@ -363,9 +386,60 @@ static void mouseButtonCallback(GLFWwindow* window, int button, int action, int 
         }
 
         if (button == GLFW_MOUSE_BUTTON_LEFT) {
+            if (g_app.ui.cropState.active) {
+                float qx, qy, qw, qh;
+                int totalRot = ((int)(g_app.targetRotation + 0.5f) + g_app.ui.cropState.rotation) % 360;
+                g_app.ui.getImageQuadBounds(g_app.windowW, g_app.windowH,
+                                            g_app.posX, g_app.posY,
+                                            (float)g_app.currentImage.width, (float)g_app.currentImage.height,
+                                            g_app.scale, totalRot,
+                                            qx, qy, qw, qh);
+                if (g_app.ui.handleCropMouseDown((float)g_app.mouseX, (float)g_app.mouseY, qx, qy, qw, qh)) {
+                    return;
+                }
+            }
+
             UIAction act = g_app.ui.handleMouseDown((float)g_app.mouseX, (float)g_app.mouseY,
                                                     g_app.folder.count(), g_app.folder.currentIndex,
                                                     (float)g_app.currentImage.width, (float)g_app.currentImage.height);
+            if (act.type == UIAction::TOGGLE_CROP_MODE) {
+                if (g_app.ui.cropState.active) {
+                    fitToWindow();
+                }
+                return;
+            }
+            if (act.type == UIAction::CROP_CANCEL) {
+                fitToWindow();
+                return;
+            }
+            if (act.type == UIAction::CROP_RESET || act.type == UIAction::CROP_SET_ASPECT ||
+                act.type == UIAction::CROP_TOGGLE_ORIENTATION || act.type == UIAction::CROP_ROTATE_CCW ||
+                act.type == UIAction::CROP_ROTATE_CW || act.type == UIAction::CROP_FLIP_H ||
+                act.type == UIAction::CROP_FLIP_V || act.type == UIAction::CROP_TOGGLE_SAVE_MENU) {
+                if (act.type == UIAction::CROP_ROTATE_CCW || act.type == UIAction::CROP_ROTATE_CW) {
+                    fitToWindow();
+                }
+                return;
+            }
+            if (act.type == UIAction::CROP_SAVE_AS || act.type == UIAction::CROP_REPLACE_ORIGINAL) {
+                std::string currentPath = g_app.folder.currentPath();
+                std::string outputPath = currentPath;
+                if (act.type == UIAction::CROP_SAVE_AS) {
+                    outputPath = image_editor::generateUniqueSavePath(currentPath);
+                }
+
+                bool ok = image_editor::executeCropAndSave(currentPath, outputPath, g_app.ui.cropState);
+                if (ok) {
+                    g_app.ui.cropState.exit();
+                    std::string savedFileName = outputPath.substr(outputPath.find_last_of("/\\") + 1);
+                    g_app.ui.showToast("Saved: " + savedFileName);
+                    g_app.folder.scan(outputPath);
+                    loadCurrentFile();
+                } else {
+                    g_app.ui.showToast("Failed to save image!");
+                }
+                return;
+            }
             if (act.type == UIAction::PAN_TO_MINIMAP_NORM) {
                 panToMinimapNorm(act.normX, act.normY);
                 return;
@@ -573,6 +647,59 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
         }
     }
 
+    // Crop & Edit Mode Active Shortcuts
+    if (g_app.ui.cropState.active) {
+        if (key == GLFW_KEY_ESCAPE) {
+            g_app.ui.cropState.exit();
+            fitToWindow();
+            return;
+        }
+        if (key == GLFW_KEY_S && (mods & GLFW_MOD_CONTROL)) {
+            std::string currentPath = g_app.folder.currentPath();
+            std::string outputPath = currentPath;
+            if (mods & GLFW_MOD_SHIFT) {
+                outputPath = image_editor::generateUniqueSavePath(currentPath);
+            }
+            bool ok = image_editor::executeCropAndSave(currentPath, outputPath, g_app.ui.cropState);
+            if (ok) {
+                g_app.ui.cropState.exit();
+                std::string savedFileName = outputPath.substr(outputPath.find_last_of("/\\") + 1);
+                g_app.ui.showToast("Saved: " + savedFileName);
+                g_app.folder.scan(outputPath);
+                loadCurrentFile();
+            } else {
+                g_app.ui.showToast("Failed to save image!");
+            }
+            return;
+        }
+        if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
+            std::string currentPath = g_app.folder.currentPath();
+            std::string outputPath = image_editor::generateUniqueSavePath(currentPath);
+            bool ok = image_editor::executeCropAndSave(currentPath, outputPath, g_app.ui.cropState);
+            if (ok) {
+                g_app.ui.cropState.exit();
+                std::string savedFileName = outputPath.substr(outputPath.find_last_of("/\\") + 1);
+                g_app.ui.showToast("Saved: " + savedFileName);
+                g_app.folder.scan(outputPath);
+                loadCurrentFile();
+            } else {
+                g_app.ui.showToast("Failed to save image!");
+            }
+            return;
+        }
+        if (key == GLFW_KEY_R) {
+            g_app.ui.cropState.resetCrop(g_app.currentImage.width, g_app.currentImage.height);
+            g_app.ui.cropState.rotation = 0;
+            g_app.ui.cropState.flipH = false;
+            g_app.ui.cropState.flipV = false;
+            g_app.ui.cropState.aspectMode = CROP_ASPECT_FREE;
+            g_app.ui.cropState.isPortrait = false;
+            fitToWindow();
+            return;
+        }
+        return;
+    }
+
     if (g_app.ui.isGridView) {
         int cols = std::max(1, (int)((g_app.windowW - 32) / 164));
         switch (key) {
@@ -678,6 +805,14 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
             centerView();
             break;
 
+        case GLFW_KEY_E:
+        case GLFW_KEY_X:
+            if (g_app.currentImage.width > 0) {
+                g_app.ui.cropState.enter(g_app.currentImage.width, g_app.currentImage.height);
+                fitToWindow();
+            }
+            break;
+
         case GLFW_KEY_G:
             g_app.ui.isGridView = !g_app.ui.isGridView;
             g_app.ui.showToast(g_app.ui.isGridView ? "Grid View" : "Single Image View");
@@ -764,6 +899,13 @@ static void dropCallback(GLFWwindow* window, int count, const char** paths) {
 // -----------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    // Restrict glibc memory arenas to prevent multi-threaded heap bloat
+    mallopt(M_ARENA_MAX, 2);
+    mallopt(M_TRIM_THRESHOLD, 128 * 1024);
+    mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+#endif
+
     std::cout << "Starting SilverViewer FilePilot (Linux / Wayland / Multi-Threaded Engine)...\n";
 
     // Shared JSON config drives spacing, timings and animation switches.
@@ -863,8 +1005,10 @@ int main(int argc, char* argv[]) {
     // much larger texture pool. Mesa may mirror texture storage in process RSS,
     // so a 256 MiB GPU budget can appear as roughly 400-500 MiB of RAM.
     g_app.ui.thumbs.setMemoryBudgetMegabytes(
-        SilverConfig::get().integer("viewer.thumbnailMemoryMegabytes", 64));
+        SilverConfig::get().integer("viewer.thumbnailMemoryMegabytes", 32));
 
+    g_app.preloader.onImageReady = []() { glfwPostEmptyEvent(); };
+    g_app.preloader.maxDecodeEdge = SilverConfig::get().integer("viewer.maxDecodeEdge", 0);
     g_app.preloader.init();
 
     // Load initial target file / directory
@@ -913,6 +1057,9 @@ int main(int argc, char* argv[]) {
                     g_app.currentImage.setFiltering(g_app.nearestFilter);
                     applyLoadedImageMeta(preloaded->meta);
                     g_app.preloader.discardUploadedPixels(currentPath);
+#if defined(__linux__) && !defined(__ANDROID__)
+                    malloc_trim(0);
+#endif
                 }
             }
         }
@@ -974,6 +1121,9 @@ int main(int argc, char* argv[]) {
 
             if (visibleTextureId) {
                 int curRotInt = ((int)(g_app.rotation + 0.5f) % 360 + 360) % 360;
+                if (g_app.ui.cropState.active) {
+                    curRotInt = (curRotInt + g_app.ui.cropState.rotation) % 360;
+                }
                 float drawW = (float)(g_app.currentImage.width > 0 ? g_app.currentImage.width : 800);
                 float drawH = (float)(g_app.currentImage.height > 0 ? g_app.currentImage.height : 600);
 
@@ -983,13 +1133,16 @@ int main(int argc, char* argv[]) {
                 // between samples.
                 float drawX = g_app.ui.font.snapToPixel(g_app.posX);
                 float drawY = g_app.ui.font.snapToPixel(g_app.posY);
+                bool flipH = g_app.ui.cropState.active ? g_app.ui.cropState.flipH : false;
+                bool flipV = g_app.ui.cropState.active ? g_app.ui.cropState.flipV : false;
                 g_app.imageShader.draw(
                     g_app.windowW, g_app.windowH,
                     drawX, drawY,
                     drawW, drawH,
                     g_app.scale, curRotInt,
                     activeBgMode, g_app.pixelGrid,
-                    visibleTextureId
+                    visibleTextureId,
+                    flipH, flipV
                 );
             }
         }

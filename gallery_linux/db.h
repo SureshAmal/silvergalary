@@ -115,9 +115,9 @@ public:
         sqlite3_busy_timeout(db, 5000); // 5000ms busy handler timeout
         sqlite3_exec(db, "PRAGMA journal_mode = WAL;", nullptr, nullptr, nullptr);
         sqlite3_exec(db, "PRAGMA synchronous = NORMAL;", nullptr, nullptr, nullptr);
-        sqlite3_exec(db, "PRAGMA cache_size = -64000;", nullptr, nullptr, nullptr); // 64MB cache
+        sqlite3_exec(db, "PRAGMA cache_size = -16000;", nullptr, nullptr, nullptr); // 16MB cache
         sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", nullptr, nullptr, nullptr);
-        sqlite3_exec(db, "PRAGMA mmap_size = 268435456;", nullptr, nullptr, nullptr); // 256MB mmap reads
+        sqlite3_exec(db, "PRAGMA mmap_size = 33554432;", nullptr, nullptr, nullptr); // 32MB mmap reads
 
         const char* schema = R"(
             CREATE TABLE IF NOT EXISTS gallery_items (

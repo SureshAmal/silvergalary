@@ -14,6 +14,9 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <malloc.h>
+#endif
 #endif
 
 #include <stb_image.h>
@@ -24,11 +27,8 @@
 #include "../viewer_linux/icons.h"
 #include "silver_config.h"
 #include "silver_anim.h"
-<<<<<<< HEAD
 #include "silver_single_instance.h"
-=======
 #include "silver_constants.h"
->>>>>>> 3d64537057f56d0bbf31fcce85d9a8ec9c8dcec4
 #include "db.h"
 #include "scanner.h"
 #include "timeline.h"
@@ -59,14 +59,11 @@ struct GalleryApp {
     bool redrawPending = true;      // drives poll-vs-wait in the main loop
     bool showRenderStats = false;   // SILVER_RENDER_STATS=1
     bool showThumbStats = false;    // SILVER_THUMB_STATS=1
-<<<<<<< HEAD
     SilverSingleInstance singleInstance;
-=======
     GLuint gpuTimerQueries[2] = { 0, 0 };
     bool gpuTimerIssued[2] = { false, false };
     int gpuTimerIndex = 0;
     double gpuFrameMs = 0.0;
->>>>>>> 3d64537057f56d0bbf31fcce85d9a8ec9c8dcec4
 };
 
 static GalleryApp g_gal;
@@ -152,6 +149,11 @@ static void closeFullscreenAndRevealSelection() {
     ui.fsPanX = 0.0f;
     ui.fsPanY = 0.0f;
     ui.isFsDragging = false;
+    ui.fullResLoader.clear();
+    ui.highResPreview.unload();
+#ifndef _WIN32
+    malloc_trim(0);
+#endif
 
     g_gal.timeline.selectItem(ui.selectedPath);
     if (const TimelineItem* item = g_gal.timeline.findItem(ui.selectedPath)) {
@@ -164,7 +166,12 @@ static void switchTab(GalleryTab tab) {
     if (g_gal.ui.currentTab == tab) return;
     g_gal.ui.currentTab = tab;
     g_gal.ui.showSidebar = false;
+    g_gal.ui.fullResLoader.clear();
+    g_gal.ui.highResPreview.unload();
     g_gal.timeline.clearSelection();
+#ifndef _WIN32
+    malloc_trim(0);
+#endif
     // Reset the scroll spring outright; animating a jump between tabs reads as
     // the grid sliding on its own.
     g_gal.ui.targetScrollY = 0.0f;
@@ -781,6 +788,11 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
 // -----------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    mallopt(M_ARENA_MAX, 2);
+    mallopt(M_TRIM_THRESHOLD, 128 * 1024);
+    mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+#endif
     std::cout << "Starting SilverGallery (Timeline Image Organizer & Fast SQLite Engine)..." << std::endl;
 
     // SilverGallery is per-user singleton. A later launch asks this process to
@@ -1092,6 +1104,15 @@ int main(int argc, char* argv[]) {
             g_gal.needsTimelineRebuild = false;
             refreshRecords();
         }
+
+#ifndef _WIN32
+        static float memTrimTimer = 0.0f;
+        memTrimTimer -= dt;
+        if (memTrimTimer <= 0.0f) {
+            memTrimTimer = 2.0f;
+            malloc_trim(0);
+        }
+#endif
 
         g_gal.ui.update(dt, g_gal.timeline.totalContentHeight, (float)g_gal.windowH, g_gal.scanner.isScanning.load());
         if (g_gal.timeline.zoomPillTimer > 0.0f) {

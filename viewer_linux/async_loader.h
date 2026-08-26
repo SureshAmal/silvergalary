@@ -53,11 +53,12 @@ public:
     // Cap for decoded preview resolution (0 = decode at native size). Keeps a
     // 100 MP photo from turning into a 400 MB RGBA buffer for a preview pane.
     int maxDecodeEdge = 0;
+    std::function<void()> onImageReady;
 
     void init() {
-        // Utilize 4-6 background workers dedicated to pre-loading and large image decoding
+        // Utilize 2-4 background workers dedicated to pre-loading and large image decoding
         unsigned int numCores = std::thread::hardware_concurrency();
-        int workerCount = (int)std::clamp(numCores > 4 ? 6u : 2u, 2u, 6u);
+        int workerCount = (int)std::clamp(numCores > 4 ? 4u : 2u, 2u, 4u);
 
         for (int i = 0; i < workerCount; ++i) {
             workers.emplace_back(&AsyncImagePreloader::workerLoop, this);
@@ -93,6 +94,21 @@ public:
 
         isCurrentLoading = true;
         if (it == cache.end()) {
+            // Keep cache strictly bounded (max 3 entries) before creating a new entry
+            while (cache.size() >= 3) {
+                auto evictIt = cache.end();
+                for (auto cit = cache.begin(); cit != cache.end(); ++cit) {
+                    if (cit->first != path && cit->first != currentLoadingPath) {
+                        evictIt = cit;
+                        break;
+                    }
+                }
+                if (evictIt != cache.end()) {
+                    cache.erase(evictIt);
+                } else {
+                    break;
+                }
+            }
             auto item = std::make_shared<PreloadedImage>();
             item->path = path;
             item->ready = false;
@@ -109,30 +125,44 @@ public:
         m_cv.notify_all();
     }
 
-    void updatePreloadTargets(const std::vector<std::string>& fileList, int currentIdx) {
+    void updatePreloadTargets(const std::vector<std::string>& fileList, int currentIdx, int ahead = 1, int behind = 0) {
         if (fileList.empty()) return;
-
         if (currentIdx < 0 || currentIdx >= (int)fileList.size()) return;
-        const std::string& current = fileList[(size_t)currentIdx];
+
+        std::vector<std::string> desired;
+        desired.reserve((size_t)(ahead + behind + 1));
+        desired.push_back(fileList[(size_t)currentIdx]);
+        for (int i = 1; i <= ahead; ++i) {
+            if (currentIdx + i < (int)fileList.size()) desired.push_back(fileList[(size_t)(currentIdx + i)]);
+        }
+        for (int i = 1; i <= behind; ++i) {
+            if (currentIdx - i >= 0) desired.push_back(fileList[(size_t)(currentIdx - i)]);
+        }
 
         std::lock_guard<std::mutex> lock(m_mutex);
-        // Full-resolution RGBA is extremely expensive (a single 5338x3559
-        // photo is ~72.5 MiB). Thumbnails already make neighboring navigation
-        // instant, so retain only the image that is actually being displayed.
         for (auto it = cache.begin(); it != cache.end();) {
-            if (it->first != current) {
+            if (std::find(desired.begin(), desired.end(), it->first) == desired.end()) {
                 it = cache.erase(it);
             } else {
                 ++it;
             }
         }
 
-        // Drop queued neighbor work left by an older navigation request. A
-        // worker already decoding one may finish, but its pixels are discarded
-        // because its cache entry was erased above.
         preloadQueue.erase(std::remove_if(preloadQueue.begin(), preloadQueue.end(),
-                                          [&](const std::string& p) { return p != current; }),
-                           preloadQueue.end());
+            [&](const std::string& p) {
+                return std::find(desired.begin(), desired.end(), p) == desired.end();
+            }), preloadQueue.end());
+
+        for (const std::string& p : desired) {
+            auto it = cache.find(p);
+            if (it != cache.end() && (it->second->ready || it->second->inProgress)) continue;
+            auto item = std::make_shared<PreloadedImage>();
+            item->path = p;
+            item->inProgress = true;
+            cache[p] = item;
+            preloadQueue.push_back(p);
+        }
+        m_cv.notify_all();
     }
 
     // Variant for callers that already know the small navigation window. It
@@ -183,12 +213,17 @@ public:
     }
 
     // uploadPixels copies into OpenGL, so keeping the same full-resolution CPU
-    // allocation afterward only doubles memory. The shared_ptr returned by
-    // getIfReady keeps it alive until the current upload call finishes.
+    // allocation afterward only doubles memory.
     void discardUploadedPixels(const std::string& path) {
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = cache.find(path);
-        if (it != cache.end() && it->second->ready) cache.erase(it);
+        if (it != cache.end()) {
+            if (it->second && it->second->data) {
+                stbi_image_free(it->second->data);
+                it->second->data = nullptr;
+            }
+            cache.erase(it);
+        }
     }
 
     void workerLoop() {
@@ -325,20 +360,23 @@ public:
                         meta.aspectRatioStr = arBuf;
                     }
 
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    auto it = cache.find(path);
-                    if (it != cache.end()) {
-                        it->second->width = w;
-                        it->second->height = h;
-                        it->second->channels = 4;
-                        it->second->data = raw;
-                        it->second->meta = meta;
-                        it->second->ready = true;
-                        it->second->inProgress = false;
-                        it->second->failed = false;
-                    } else {
-                        silvercodec::freePixels(raw);
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        auto it = cache.find(path);
+                        if (it != cache.end()) {
+                            it->second->width = w;
+                            it->second->height = h;
+                            it->second->channels = 4;
+                            it->second->data = raw;
+                            it->second->meta = meta;
+                            it->second->ready = true;
+                            it->second->inProgress = false;
+                            it->second->failed = false;
+                        } else {
+                            silvercodec::freePixels(raw);
+                        }
                     }
+                    if (onImageReady) onImageReady();
                 } else {
                     // A corrupt or unsupported file is a completed failure, not
                     // an operation that remains "loading" forever.

@@ -164,7 +164,7 @@ inline void reloadFromConfig() {
     loadChannel(r.chZoomPopup,    "zoomPopup",    r.zoomPopup,    3.6f, 0.85f,  0.3f);
     loadChannel(r.chThemeMenu,    "themeMenu",    r.themeMenu,    3.6f, 0.85f,  0.3f);
     loadChannel(r.chTabIndicator, "tabIndicator", r.tabIndicator, 3.4f, 0.85f,  0.2f);
-    loadChannel(r.chFilmstrip,    "filmstrip",    r.filmstrip,    2.4f, 1.00f,  0.0f);
+    loadChannel(r.chFilmstrip,    "filmstrip",    r.filmstrip,    5.0f, 1.00f,  0.0f);
 
     loadChannel(r.chViewerTransform,  "viewerTransform",  24.0f, 3.4f, 1.00f, 0.0f);
     loadChannel(r.chViewerChrome,     "viewerChrome",     14.0f, 2.6f, 1.00f, 0.0f);

@@ -2,7 +2,7 @@
   "//": "SilverGallery configuration. Every value here is live-reloaded on save.",
   "layout": {
     "topBarHeight": 60,
-    "sidebarWidth": 360,
+    "sidebarWidth": 350,
     "sidebarInnerPadding": 16,
     "contentTopOffset": 70,
     "bottomPadding": 60,
@@ -13,7 +13,7 @@
   },
   "grid": {
     "gap": 12,
-    "sidePadding": 25,
+    "sidePadding": 32,
     "sectionHeaderHeight": 46,
     "sectionSpacing": 20,
     "sectionBottomPadding": 16,
@@ -122,7 +122,7 @@
     "hinting": "normal",
     "forceAutohint": true,
     "//pixelSize": "Interface text size in points; the whole UI scales with it.",
-    "pixelSize": 13
+    "pixelSize": 17
   },
   "gif": {
     "//": "Animated GIF playback and decode caps.",
@@ -133,7 +133,7 @@
   "animation": {
     "//": "enabled:false makes every transition instant.",
     "enabled": true,
-    "speedMultiplier": 1,
+    "speedMultiplier": 2.35,
     "regroupStartScale": 0.88,
     "regroupEnterOffset": 24,
     "regroupMaxSizeRatio": 1.18,
@@ -241,7 +241,7 @@
     "//masterTier": "One cached image per photo at this size; every smaller size is derived from it. 0 = largest tier.",
     "masterTier": 0,
     "//maxResidentMegabytes": "GPU memory budget for thumbnails. Counting textures instead of bytes meant this scaled with the zoom tier.",
-    "maxResidentMegabytes": 256,
+    "maxResidentMegabytes": 128,
     "atlasSize": 4096,
     "uploadsPerFrame": 32,
     "diskCache": true,
@@ -249,7 +249,7 @@
     "useSharedCache": true,
     "diskCacheQuality": 85,
     "//previewMaxEdge": "0 keeps full source resolution for a pixel-perfect fullscreen viewer; set a pixel cap to reduce memory use.",
-    "previewMaxEdge": 0,
+    "previewMaxEdge": 2560,
     "prewarmLibrary": true,
     "//prewarmWorkers": "0 = auto (worker count minus reservedWorkers)",
     "prewarmWorkers": 0,

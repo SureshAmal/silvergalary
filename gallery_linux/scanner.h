@@ -20,6 +20,9 @@
 #include "easyexif/exif.h"
 #include "silver_codec.h"
 #include "silver_config.h"
+#ifndef _WIN32
+#include <malloc.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -378,6 +381,9 @@ private:
 
         hasFreshData.store(true);
         isScanning.store(false);
+#ifndef _WIN32
+        malloc_trim(0);
+#endif
     }
 
     GalleryRecord inspectFile(const Candidate& c) {

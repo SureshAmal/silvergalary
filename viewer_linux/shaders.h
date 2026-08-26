@@ -14,6 +14,8 @@ public:
     GLint uImageSizeLoc = -1;
     GLint uScaleLoc = -1;
     GLint uRotationLoc = -1;
+    GLint uFlipHLoc = -1;
+    GLint uFlipVLoc = -1;
     GLint uBgModeLoc = -1;
     GLint uCheckerSizeLoc = -1;
     GLint uPixelGridLoc = -1;
@@ -37,13 +39,18 @@ public:
             uniform vec2 uImageSize;
             uniform float uScale;
             uniform int uRotation;
+            uniform int uFlipH;
+            uniform int uFlipV;
 
             out vec2 vUV;
             out vec2 vPixelCoord;
 
             void main() {
-                vUV = aUV;
-                vPixelCoord = aUV * uImageSize;
+                vec2 uv = aUV;
+                if (uFlipH == 1) uv.x = 1.0 - uv.x;
+                if (uFlipV == 1) uv.y = 1.0 - uv.y;
+                vUV = uv;
+                vPixelCoord = uv * uImageSize;
 
                 // Rotate local coords around image center (0.5, 0.5)
                 vec2 local = aPos - vec2(0.5, 0.5);
@@ -134,6 +141,8 @@ public:
         uImageSizeLoc = glGetUniformLocation(program, "uImageSize");
         uScaleLoc = glGetUniformLocation(program, "uScale");
         uRotationLoc = glGetUniformLocation(program, "uRotation");
+        uFlipHLoc = glGetUniformLocation(program, "uFlipH");
+        uFlipVLoc = glGetUniformLocation(program, "uFlipV");
         uBgModeLoc = glGetUniformLocation(program, "uBgMode");
         uCheckerSizeLoc = glGetUniformLocation(program, "uCheckerSize");
         uPixelGridLoc = glGetUniformLocation(program, "uPixelGrid");
@@ -251,7 +260,8 @@ public:
               float imgW, float imgH,
               float scale, int rotation,
               int bgMode, bool pixelGrid,
-              GLuint textureID) {
+              GLuint textureID,
+              bool flipH = false, bool flipV = false) {
         if (!textureID) return;
 
         glUseProgram(program);
@@ -261,6 +271,8 @@ public:
         glUniform2f(uImageSizeLoc, imgW, imgH);
         glUniform1f(uScaleLoc, scale);
         glUniform1i(uRotationLoc, rotation);
+        glUniform1i(uFlipHLoc, flipH ? 1 : 0);
+        glUniform1i(uFlipVLoc, flipV ? 1 : 0);
         glUniform1i(uBgModeLoc, bgMode);
         glUniform1f(uCheckerSizeLoc, 24.0f);
         glUniform1i(uPixelGridLoc, pixelGrid ? 1 : 0);

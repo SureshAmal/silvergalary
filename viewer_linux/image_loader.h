@@ -372,6 +372,11 @@ public:
 
         glBindTexture(GL_TEXTURE_2D, 0);
 
+        if (rawData) {
+            silvercodec::freePixels(rawData);
+            rawData = nullptr;
+        }
+
         isLoaded = true;
         return true;
     }

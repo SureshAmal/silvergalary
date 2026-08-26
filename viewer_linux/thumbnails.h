@@ -87,12 +87,12 @@ public:
     // 2000 textures is 205 MB at tier 160 but 2.1 GB at tier 512, because a
     // 512x512 RGBA thumbnail is 1 MB. Budgeting in bytes is tier-independent and
     // is what texture streaming systems do.
-    size_t maxResidentBytes = 256ull * 1024 * 1024;
+    size_t maxResidentBytes = 32ull * 1024 * 1024;
     size_t residentBytes = 0;
     size_t residentTextures = 0;   // kept for diagnostics only
     int uploadsPerFrame = 32;
     int diskCacheQuality = 85;
-    std::vector<int> tiers = { 96, 160, 256, 384, 512 };
+    std::vector<int> tiers = { 96, 160, 256 };
     float tierHeadroom = 1.35f;
     float pixelScale = 1.0f;
 
@@ -122,11 +122,10 @@ public:
         return false;
     }
 
-    // One cached image per photo, at the largest tier. Every smaller size is
-    // derived from it in memory (~2 ms) rather than decoded from the original
-    // (~16 ms) and stored separately. Caching per tier meant a photo could be
-    // decoded four times and stored four times.
-    int masterTier = 512;
+    // In viewer mode, thumbnails are 60px in the filmstrip and 150px in grid view.
+    // Setting masterTier to 160 (instead of 512) reduces per-thumbnail memory from 1 MB to 100 KB (10x reduction).
+    int masterTier = 160;
+    bool emitPreviewsEnabled = false;
     uint64_t frameCounter = 0;
     float lastFrameDt = 1.0f / 60.0f;
 
@@ -162,6 +161,10 @@ public:
 
     void setPixelScale(float scale) {
         pixelScale = (scale >= silver::defaults::minPixelScale) ? scale : 1.0f;
+    }
+
+    void setMemoryBudgetMegabytes(int megabytes) {
+        maxResidentBytes = (size_t)std::max(16, megabytes) * 1024ull * 1024ull;
     }
 
     float scrollOffset = 0.0f;
@@ -568,7 +571,7 @@ public:
         return tiers.back();
     }
 
-    void requestThumbnail(const std::string& path, bool highPriority = false, int edge = 512) {
+    void requestThumbnail(const std::string& path, bool highPriority = false, int edge = 160) {
         std::lock_guard<std::mutex> lock(queueLock);
         if (highPriority) {
             // Pinned requests (selection, fullscreen) survive viewport churn.
@@ -622,19 +625,34 @@ public:
         std::lock_guard<std::mutex> lock(queueLock);
         if (files.empty()) return;
 
-        // Prioritize items near currentIdx outward
+        // Prioritize items near currentIdx outward within a sliding window for GPU texture upload
         int n = (int)files.size();
-        std::vector<int> indices;
-        indices.reserve(n);
-        if (currentIdx >= 0 && currentIdx < n) indices.push_back(currentIdx);
-        for (int d = 1; d < n; ++d) {
-            if (currentIdx + d < n) indices.push_back(currentIdx + d);
-            if (currentIdx - d >= 0) indices.push_back(currentIdx - d);
+        std::vector<int> nearIndices;
+        const int kMaxNearDistance = 30; // GPU textures for +/- 30 items around current viewport
+        if (currentIdx >= 0 && currentIdx < n) nearIndices.push_back(currentIdx);
+        for (int d = 1; d <= kMaxNearDistance; ++d) {
+            if (currentIdx + d < n) nearIndices.push_back(currentIdx + d);
+            if (currentIdx - d >= 0) nearIndices.push_back(currentIdx - d);
         }
 
-        for (int idx : indices) {
+        for (int idx : nearIndices) {
             enqueueLocked(files[idx], edge, false);
         }
+
+        // For items further away, put them into prewarmQueue with diskOnly=true
+        // so they are cached on disk without accumulating uncompressed textures in RAM
+        for (int d = kMaxNearDistance + 1; d < n; ++d) {
+            if (currentIdx + d < n) {
+                if (!hasFreshDiskEntry(files[currentIdx + d], masterTier))
+                    prewarmQueue.push_back(ThumbRequest{ files[currentIdx + d], masterTier, true });
+            }
+            if (currentIdx - d >= 0) {
+                if (!hasFreshDiskEntry(files[currentIdx - d], masterTier))
+                    prewarmQueue.push_back(ThumbRequest{ files[currentIdx - d], masterTier, true });
+            }
+        }
+        prewarmRemaining.store((int)prewarmQueue.size());
+        recountOutstanding();
         cv.notify_all();
     }
 
@@ -800,7 +818,12 @@ public:
                 recountOutstanding();
             }
             {
-                std::lock_guard<std::mutex> rlock(readyLock);
+                std::unique_lock<std::mutex> rlock(readyLock);
+                while (running && readyQueue.size() >= 48) {
+                    rlock.unlock();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    rlock.lock();
+                }
                 readyQueue.push_back(std::move(dt));
             }
             if (onWorkReady) onWorkReady();
@@ -947,6 +970,7 @@ public:
     // next to the decode that just happened, and only runs on a fresh decode -
     // never when serving from cache.
     void emitPreview(const DecodedThumb& thumb) {
+        if (!emitPreviewsEnabled) return;
         if (thumb.data.empty() || thumb.w <= 0 || thumb.h <= 0) return;
 
         std::vector<unsigned char> out((size_t)kPreviewDim * kPreviewDim * 3, 0);
@@ -1006,8 +1030,8 @@ public:
         // frame once the pool is full.
         size_t target = maxResidentBytes * 3 / 4;
         for (size_t i = 0; i < victims.size() && residentBytes > target; ++i) {
-            // Never drop something drawn in the last few frames.
-            if (frameCounter - victims[i].first < 4) break;
+            // Never drop something drawn in the last 60 frames (1 second).
+            if (frameCounter - victims[i].first < 60) break;
             auto it = cache.find(victims[i].second);
             if (it == cache.end() || !it->second.texId) continue;
 
@@ -1082,17 +1106,13 @@ public:
             tw = std::max(1, (int)((int64_t)thumb.w * edge / thumb.h));
         }
 
-        unsigned char* src = (unsigned char*)malloc(thumb.data.size());
-        if (!src) { thumb.edge = edge; return; }
-        memcpy(src, thumb.data.data(), thumb.data.size());
-
-        unsigned char* dst = silvercodec::resizeRGBA(src, thumb.w, thumb.h, tw, th);
-        if (dst) {
-            thumb.data.assign(dst, dst + (size_t)tw * th * 4);
-            thumb.w = tw;
-            thumb.h = th;
-            silvercodec::freePixels(dst);
-        }
+        unsigned char* dst = (unsigned char*)malloc((size_t)tw * th * 4);
+        if (!dst) { thumb.edge = edge; return; }
+        stbir_resize_uint8(thumb.data.data(), thumb.w, thumb.h, 0, dst, tw, th, 0, 4);
+        thumb.data.assign(dst, dst + (size_t)tw * th * 4);
+        thumb.w = tw;
+        thumb.h = th;
+        free(dst);
         thumb.edge = edge;
     }
 
@@ -1368,14 +1388,19 @@ public:
         return ready;
     }
 
-    void centerOnIndex(int idx, int total, float windowW, float thumbW, float thumbGap) {
+    void centerOnIndex(int idx, int total, float windowW, float thumbW, float thumbGap, bool snapImmediate = false) {
         float itemStep = thumbW + thumbGap;
-        float centerPos = idx * itemStep + thumbW * 0.5f;
+        float centerPos = 16.0f + idx * itemStep + thumbW * 0.5f;
         targetScrollOffset = centerPos - windowW * 0.5f;
 
-        float maxScroll = std::max(0.0f, total * itemStep - windowW + thumbGap);
+        float maxScroll = std::max(0.0f, total * itemStep - thumbGap + 32.0f - windowW);
         if (targetScrollOffset < 0.0f) targetScrollOffset = 0.0f;
         if (targetScrollOffset > maxScroll) targetScrollOffset = maxScroll;
+
+        if (snapImmediate) {
+            scrollOffset = targetScrollOffset;
+            scrollVelocity = 0.0f;
+        }
     }
 
 private:
@@ -1383,9 +1408,12 @@ private:
     void enqueueLocked(const std::string& path, int edge, bool highPriority) {
         auto it = cache.find(path);
         if (it != cache.end()) {
-            bool residentForTarget = it->second.ready && it->second.loadedEdge >= edge &&
+            bool residentForTarget = it->second.ready && (it->second.loadedEdge >= edge || it->second.texId > 0) &&
                 (!atlasEnabled || it->second.texId == atlasTexture);
-            if (residentForTarget) return;
+            if (residentForTarget) {
+                it->second.lastUsedFrame = frameCounter;
+                return;
+            }
             if (it->second.failed) return;                                 // known bad file
         }
 

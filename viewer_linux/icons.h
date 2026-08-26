@@ -72,6 +72,15 @@ enum IconType {
     ICON_LIST,
     ICON_COLUMNS,
     ICON_SLIDERS,
+    ICON_CROP,
+    ICON_ROTATE_CCW,
+    ICON_ROTATE_CW,
+    ICON_FLIP_H,
+    ICON_FLIP_V,
+    ICON_ASPECT_RATIO,
+    ICON_LANDSCAPE,
+    ICON_PORTRAIT,
+    ICON_SAVE,
     ICON_COUNT
 };
 
@@ -177,9 +186,14 @@ public:
     void drawIcon(FontRenderer& r, IconType type, float x, float y, float w, float h, Color4 col) {
         if (type < 0 || type >= ICON_COUNT) return;
 
+        // If a bounding box (w, h) is provided where w != h, center the square icon inside
+        float sizePts = std::min(w, h);
+        if (sizePts <= 0.0f) sizePts = std::max(w, h);
+        float iconX = x + (w - sizePts) * 0.5f;
+        float iconY = y + (h - sizePts) * 0.5f;
+
         // Rasterize at framebuffer resolution, lay out in points. Both the size
         // and the position are snapped to whole physical pixels.
-        float sizePts = std::max(w, h);
         int px = (int)std::lround(sizePts * pixelScale);
         if (px < 4) px = 4;
         if (px > silver::limits::maxIconRasterPixels) px = silver::limits::maxIconRasterPixels;
@@ -188,8 +202,8 @@ public:
         if (!e) return;
 
         const float inv = 1.0f / pixelScale;
-        float x0 = std::round(x * pixelScale) * inv;
-        float y0 = std::round(y * pixelScale) * inv;
+        float x0 = std::round(iconX * pixelScale) * inv;
+        float y0 = std::round(iconY * pixelScale) * inv;
         float x1 = x0 + (float)e->w * inv;
         float y1 = y0 + (float)e->h * inv;
 
@@ -208,23 +222,25 @@ public:
     void drawIconRotated(FontRenderer& r, IconType type, float x, float y,
                          float w, float h, float radians, Color4 col) {
         if (type < 0 || type >= ICON_COUNT) return;
-        int px = (int)std::lround(std::max(w, h) * pixelScale);
+        float sizePts = std::min(w, h);
+        if (sizePts <= 0.0f) sizePts = std::max(w, h);
+        int px = (int)std::lround(sizePts * pixelScale);
         px = std::clamp(px, 4, 512);
         const Entry* e = ensure(type, px);
         if (!e) return;
 
         float cx = x + w * 0.5f, cy = y + h * 0.5f;
+        float hw = sizePts * 0.5f, hh = sizePts * 0.5f;
         float cs = std::cos(radians), sn = std::sin(radians);
-        auto point = [&](float px0, float py0, float& ox, float& oy) {
-            float dx = px0 - cx, dy = py0 - cy;
+        auto point = [&](float dx, float dy, float& ox, float& oy) {
             ox = cx + dx * cs - dy * sn;
             oy = cy + dx * sn + dy * cs;
         };
         float x0, y0, x1, y1, x2, y2, x3, y3;
-        point(x,     y,     x0, y0);
-        point(x + w, y,     x1, y1);
-        point(x + w, y + h, x2, y2);
-        point(x,     y + h, x3, y3);
+        point(-hw, -hh, x0, y0);
+        point( hw, -hh, x1, y1);
+        point( hw,  hh, x2, y2);
+        point(-hw,  hh, x3, y3);
         UIVertex v[6] = {
             {x0,y0,e->u0,e->v0,col.r,col.g,col.b,col.a,3.0f},
             {x1,y1,e->u1,e->v0,col.r,col.g,col.b,col.a,3.0f},

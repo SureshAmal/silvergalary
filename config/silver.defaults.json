@@ -1,5 +1,5 @@
 {
-  "//": "SilverGallery configuration. Every value here is live-reloaded on save.",
+  "//": "SHIPPED DEFAULTS. Compiled into the binary; never written to at runtime. User settings live in config/silver.json or ~/.config/silver_gallery/silver.json.",
   "layout": {
     "topBarHeight": 60,
     "sidebarWidth": 350,
@@ -68,11 +68,13 @@
   "viewer": {
     "wheelZoomStep": 0.14,
     "//zoomMode": "auto | lock | width | height | fit | fill. Cycled with Z.",
-    "zoomMode": "width",
+    "zoomMode": "fit",
     "//thumbnailMemoryMegabytes": "Viewer-only GPU budget; gallery keeps thumbnails.maxResidentMegabytes.",
     "thumbnailMemoryMegabytes": 64
   },
   "rendering": {
+    "//colorManagement": "Convert images carrying an embedded ICC profile to sRGB on load. Off shows their raw numbers, which is wrong for Display P3 and Adobe RGB photos.",
+    "colorManagement": true,
     "vertexBufferMegabytes": 32
   },
   "scrollbar": {
@@ -259,7 +261,7 @@
   },
   "theme": {
     "//name": "Active UI theme. Built in: material-expressive, classic-slate.",
-    "name": "classic-slate",
+    "name": "material-expressive",
     "//mode": "system | dark | light",
     "mode": "system",
     "//overrides": "Any token of the active theme can be overridden. Colours take #RRGGBB or #RRGGBBAA. Shape tiers and spring values take numbers. Omit what you do not want to change.",
@@ -271,6 +273,44 @@
       "state": {},
       "motion": {}
     }
+  },
+  "hotkeys": {
+    "//": "Viewer keyboard shortcuts. Written the way people write them: Ctrl+K, Shift+Delete, F5, Space. Change one here and it takes effect on restart.",
+    "trash": "Delete",
+    "deleteForever": "Shift+Delete",
+    "copyPath": "Ctrl+C",
+    "revealInFolder": "Ctrl+E",
+    "openExternally": "Ctrl+O",
+    "colorPicker": "Ctrl+K",
+    "invertColors": "Ctrl+I",
+    "channelRed": "Ctrl+1",
+    "channelGreen": "Ctrl+2",
+    "channelBlue": "Ctrl+3",
+    "channelAlpha": "Ctrl+4",
+    "channelAll": "Ctrl+0",
+    "cycleZoomMode": "Z",
+    "slideshowToggle": "F5",
+    "slideshowPause": "Space"
+  },
+  "slideshow": {
+    "//intervalSeconds": "Seconds each photo is shown. F5 starts and stops; Space pauses.",
+    "intervalSeconds": 5,
+    "//randomInterval": "Vary the delay between randomMinSeconds and randomMaxSeconds so the pacing is not metronomic.",
+    "randomInterval": false,
+    "randomMinSeconds": 3,
+    "randomMaxSeconds": 10,
+    "//shuffle": "Pick the next photo at random instead of walking the folder in order.",
+    "shuffle": false,
+    "loop": true,
+    "showCountdown": true,
+    "//fullscreen": "Enter fullscreen automatically when a slideshow starts.",
+    "fullscreen": true
+  },
+  "library": {
+    "//sortBy": "Order photos are listed in: taken | modified | name | size | random.",
+    "sortBy": "taken",
+    "//sortAscending": "false puts newest/largest first, which is what a photo library usually wants.",
+    "sortAscending": false
   },
   "scanner": {
     "batchSize": 450,

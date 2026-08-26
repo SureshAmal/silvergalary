@@ -2,7 +2,11 @@
 #include "image_loader.h"
 #include "shaders.h"
 #include "folder.h"
+#include <ctime>
+#include <cstdlib>
 #include "ui.h"
+#include "silver_fileops.h"
+#include "silver_hotkeys.h"
 #include "async_loader.h"
 #include "silver_constants.h"
 #include <GLFW/glfw3.h>
@@ -13,7 +17,70 @@
 #include <malloc.h>
 #endif
 
+// Material's six zoom modes. ScaleToFit is what the viewer always did; the rest
+// were simply not expressible.
+enum class ZoomMode {
+    AutoZoom,        // fit when larger than the window, otherwise 1:1
+    LockZoom,        // keep the current zoom across images
+    ScaleToWidth,
+    ScaleToHeight,
+    ScaleToFit,
+    ScaleToFill      // cover the window, cropping the overflow
+};
+
+inline const char* zoomModeName(ZoomMode m) {
+    switch (m) {
+        case ZoomMode::AutoZoom:      return "Auto zoom";
+        case ZoomMode::LockZoom:      return "Lock zoom";
+        case ZoomMode::ScaleToWidth:  return "Scale to width";
+        case ZoomMode::ScaleToHeight: return "Scale to height";
+        case ZoomMode::ScaleToFit:    return "Scale to fit";
+        case ZoomMode::ScaleToFill:   return "Scale to fill";
+    }
+    return "Scale to fit";
+}
+
+inline ZoomMode zoomModeFromName(const std::string& n) {
+    if (n == "auto")     return ZoomMode::AutoZoom;
+    if (n == "lock")     return ZoomMode::LockZoom;
+    if (n == "width")    return ZoomMode::ScaleToWidth;
+    if (n == "height")   return ZoomMode::ScaleToHeight;
+    if (n == "fill")     return ZoomMode::ScaleToFill;
+    return ZoomMode::ScaleToFit;
+}
+
+inline const char* zoomModeKey(ZoomMode m) {
+    switch (m) {
+        case ZoomMode::AutoZoom:      return "auto";
+        case ZoomMode::LockZoom:      return "lock";
+        case ZoomMode::ScaleToWidth:  return "width";
+        case ZoomMode::ScaleToHeight: return "height";
+        case ZoomMode::ScaleToFit:    return "fit";
+        case ZoomMode::ScaleToFill:   return "fill";
+    }
+    return "fit";
+}
+
 struct AppState {
+    ZoomMode zoomMode = ZoomMode::ScaleToFit;
+    // Colour inspection. channelMask is a bitmask: 1=R 2=G 4=B, 8 shows alpha
+    // as greyscale, 7 is the normal image.
+    bool invertColors = false;
+    int channelMask = 7;
+    // Colour picker. Samples the decoded image rather than the framebuffer, so
+    // the checkerboard, inversion and channel isolation cannot contaminate the
+    // reading - the point of the tool is the file's actual pixel.
+    // Slideshow.
+    silverhotkeys::Map hotkeys;
+    bool slideshowActive = false;
+    bool slideshowPaused = false;
+    float slideshowRemaining = 0.0f;
+    float slideshowInterval = 5.0f;
+
+    bool colorPickerActive = false;
+    bool pickValid = false;
+    unsigned char pickR = 0, pickG = 0, pickB = 0, pickA = 255;
+    int pickX = 0, pickY = 0;
     GLFWwindow* window = nullptr;
     int windowW = silver::defaults::viewerWindowWidth;
     int windowH = silver::defaults::viewerWindowHeight;
@@ -80,6 +147,8 @@ static void calculateFitParameters(float& outScale, float& outPosX, float& outPo
     float imgH = (float)g_app.currentImage.height;
 
     int curRotInt = ((int)(g_app.targetRotation + 0.5f) % 360 + 360) % 360;
+    // These apply everywhere, so they must sit ahead of the crop-tool branch;
+    // nested inside it they only fired while cropping was open.
     if (g_app.ui.cropState.active) {
         curRotInt = (curRotInt + g_app.ui.cropState.rotation) % 360;
     }
@@ -89,10 +158,150 @@ static void calculateFitParameters(float& outScale, float& outPosX, float& outPo
 
     float scaleX = availW / imgW;
     float scaleY = availH / imgH;
-    outScale = std::min(scaleX, scaleY);
+    switch (g_app.zoomMode) {
+        case ZoomMode::ScaleToWidth:  outScale = scaleX; break;
+        case ZoomMode::ScaleToHeight: outScale = scaleY; break;
+        case ZoomMode::ScaleToFill:   outScale = std::max(scaleX, scaleY); break;
+        case ZoomMode::AutoZoom:
+            // Only shrink. Blowing a 200px icon up to fill a 4K window is not
+            // "fitting" it, it is destroying it.
+            outScale = std::min(1.0f, std::min(scaleX, scaleY));
+            break;
+        case ZoomMode::LockZoom:
+            // Keep whatever the user set; position still recentres below.
+            outScale = (g_app.targetScale > 0.0f) ? g_app.targetScale
+                                                  : std::min(scaleX, scaleY);
+            break;
+        case ZoomMode::ScaleToFit:
+        default:                      outScale = std::min(scaleX, scaleY); break;
+    }
 
     outPosX = g_app.ui.cropState.active ? (((float)g_app.windowW - sidePanelReserve) * 0.5f) : ((float)g_app.windowW * 0.5f);
     outPosY = g_app.ui.presentationMode ? ((float)g_app.windowH * 0.5f) : (g_app.ui.topBarH + availH * 0.5f + 16.0f);
+}
+
+
+// Map a screen position back to a pixel in the decoded image, undoing the pan,
+// zoom, rotation and flips the shader applies. Returns false when the cursor is
+// not over the image.
+static bool sampleImagePixel(double mx, double my) {
+    const ImageTexture& img = g_app.currentImage;
+    if (!img.rawData || img.width <= 0 || img.height <= 0) return false;
+
+    int rot = ((int)(g_app.rotation + 0.5f) % 360 + 360) % 360;
+    float dispW = img.width * g_app.scale;
+    float dispH = img.height * g_app.scale;
+    if (rot == 90 || rot == 270) std::swap(dispW, dispH);
+    if (dispW <= 0.0f || dispH <= 0.0f) return false;
+
+    float u = (float)(mx - g_app.posX) / dispW;
+    float v = (float)(my - g_app.posY) / dispH;
+    if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) return false;
+
+    // Flips only exist while the crop tool is open, matching the draw call.
+    if (g_app.ui.cropState.active) {
+        if (g_app.ui.cropState.flipH) u = 1.0f - u;
+        if (g_app.ui.cropState.flipV) v = 1.0f - v;
+    }
+
+    // Forward transform is image -> display; this is its inverse.
+    float a = u, b = v;
+    switch (rot) {
+        case 90:  a = v;        b = 1.0f - u; break;
+        case 180: a = 1.0f - u; b = 1.0f - v; break;
+        case 270: a = 1.0f - v; b = u;        break;
+        default:  break;
+    }
+
+    int px = std::clamp((int)(a * img.width),  0, img.width  - 1);
+    int py = std::clamp((int)(b * img.height), 0, img.height - 1);
+    const unsigned char* p = img.rawData + ((size_t)py * img.width + px) * 4;
+    g_app.pickR = p[0]; g_app.pickG = p[1]; g_app.pickB = p[2]; g_app.pickA = p[3];
+    g_app.pickX = px;   g_app.pickY = py;
+    return true;
+}
+
+static std::string pickedHex() {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "#%02X%02X%02X", g_app.pickR, g_app.pickG, g_app.pickB);
+    return buf;
+}
+
+
+
+// Every configurable action, with its default binding. This list is the single
+// source of truth: the config reader, the key handler and any UI that wants to
+// show a shortcut all read from it.
+static const std::vector<std::pair<const char*, const char*>>& viewerActions() {
+    static const std::vector<std::pair<const char*, const char*>> kActions = {
+        { "trash",           "Delete" },
+        { "deleteForever",   "Shift+Delete" },
+        { "copyPath",        "Ctrl+C" },
+        { "revealInFolder",  "Ctrl+E" },
+        { "openExternally",  "Ctrl+O" },
+        { "colorPicker",     "Ctrl+K" },
+        { "invertColors",    "Ctrl+I" },
+        { "channelRed",      "Ctrl+1" },
+        { "channelGreen",    "Ctrl+2" },
+        { "channelBlue",     "Ctrl+3" },
+        { "channelAlpha",    "Ctrl+4" },
+        { "channelAll",      "Ctrl+0" },
+        { "cycleZoomMode",   "Z" },
+        { "slideshowToggle", "F5" },
+        { "slideshowPause",  "Space" },
+    };
+    return kActions;
+}
+
+static void loadCurrentFile();
+static void toggleFullscreen();
+
+// Interval for the next slide. A fixed cadence turns a slideshow into a metronome,
+// so the random mode varies it within a configured band instead.
+static float nextSlideInterval() {
+    const SilverConfig& cfg = SilverConfig::get();
+    float base = std::max(0.5f, cfg.num("slideshow.intervalSeconds", 5.0f));
+    if (!cfg.flag("slideshow.randomInterval", false)) return base;
+    float lo = std::max(0.5f, cfg.num("slideshow.randomMinSeconds", 3.0f));
+    float hi = std::max(lo, cfg.num("slideshow.randomMaxSeconds", 10.0f));
+    float t = (float)(rand() % 1001) / 1000.0f;
+    return lo + (hi - lo) * t;
+}
+
+static void slideshowAdvance() {
+    const SilverConfig& cfg = SilverConfig::get();
+    if (cfg.flag("slideshow.shuffle", false) && g_app.folder.count() > 1) {
+        int idx = rand() % g_app.folder.count();
+        g_app.folder.jumpTo(idx);
+        loadCurrentFile();
+    } else if (!g_app.folder.next()) {
+        if (cfg.flag("slideshow.loop", true) && g_app.folder.first()) {
+            loadCurrentFile();
+        } else {
+            // Reached the end with looping off: stop rather than sit on the last
+            // frame pretending to still be running.
+            g_app.slideshowActive = false;
+            g_app.ui.showToast("Slideshow finished");
+            return;
+        }
+    } else {
+        loadCurrentFile();
+    }
+    g_app.slideshowRemaining = nextSlideInterval();
+}
+
+static void slideshowToggle() {
+    g_app.slideshowActive = !g_app.slideshowActive;
+    g_app.slideshowPaused = false;
+    if (g_app.slideshowActive) {
+        g_app.slideshowRemaining = nextSlideInterval();
+        if (SilverConfig::get().flag("slideshow.fullscreen", true) && !g_app.isFullscreen) {
+            toggleFullscreen();
+        }
+        g_app.ui.showToast("Slideshow started");
+    } else {
+        g_app.ui.showToast("Slideshow stopped");
+    }
 }
 
 static void fitToWindow(bool immediate = false) {
@@ -339,6 +548,10 @@ static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     g_app.mouseX = xpos;
     g_app.mouseY = ypos;
     g_app.ui.notifyUserActivity();
+
+    if (g_app.colorPickerActive && !g_app.ui.isGridView) {
+        g_app.pickValid = sampleImagePixel(xpos, ypos);
+    }
 
     if (g_app.ui.cropState.active) {
         float qx, qy, qw, qh;
@@ -616,7 +829,7 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
 
     // Ctrl + 1 (100%), Ctrl + 2 (200%), Ctrl + 3 (300%), Ctrl + 0 (Fit)
     if (mods & GLFW_MOD_CONTROL) {
-        if (key == GLFW_KEY_1) {
+        if (key == GLFW_KEY_1 && !(mods & GLFW_MOD_CONTROL)) {
             g_app.targetScale = 1.0f;
             calculateFitParameters(g_app.fitScale, g_app.fitPosX, g_app.fitPosY);
             g_app.targetPosX = g_app.fitPosX;
@@ -624,7 +837,7 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
             g_app.ui.showToast("Zoom: 100%");
             return;
         }
-        if (key == GLFW_KEY_2) {
+        if (key == GLFW_KEY_2 && !(mods & GLFW_MOD_CONTROL)) {
             g_app.targetScale = 2.0f;
             calculateFitParameters(g_app.fitScale, g_app.fitPosX, g_app.fitPosY);
             g_app.targetPosX = g_app.fitPosX;
@@ -632,7 +845,7 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
             g_app.ui.showToast("Zoom: 200%");
             return;
         }
-        if (key == GLFW_KEY_3) {
+        if (key == GLFW_KEY_3 && !(mods & GLFW_MOD_CONTROL)) {
             g_app.targetScale = 3.0f;
             calculateFitParameters(g_app.fitScale, g_app.fitPosX, g_app.fitPosY);
             g_app.targetPosX = g_app.fitPosX;
@@ -640,12 +853,101 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
             g_app.ui.showToast("Zoom: 300%");
             return;
         }
-        if (key == GLFW_KEY_0) {
+        if (key == GLFW_KEY_0 && !(mods & GLFW_MOD_CONTROL)) {
             fitToWindow();
             g_app.ui.showToast("Fit to Window");
             return;
         }
     }
+
+    // ---- configurable actions --------------------------------------
+    // Resolved from the hotkey table rather than matched inline, so a binding's
+    // meaning no longer depends on which block it happens to sit in.
+    {
+        const std::string act = g_app.hotkeys.actionFor(key, mods);
+        if (!act.empty()) {
+            if (act == "trash" || act == "deleteForever") {
+                const std::string path = g_app.folder.currentPath();
+                if (!path.empty()) {
+                    bool permanent = (act == "deleteForever");
+                    auto res = permanent ? silverfileops::deletePermanently(path)
+                                         : silverfileops::moveToTrash(path);
+                    if (res.ok) {
+                        g_app.ui.showToast(permanent ? "Deleted permanently" : "Moved to trash");
+                        if (g_app.folder.removeCurrentAndAdvance()) loadCurrentFile();
+                    } else {
+                        g_app.ui.showToast("Delete failed: " + res.error);
+                    }
+                }
+                return;
+            }
+            if (act == "copyPath") {
+                // While the picker is open this copies the colour instead; that
+                // is the more useful reading of the same gesture in that mode.
+                if (g_app.colorPickerActive && g_app.pickValid) {
+                    glfwSetClipboardString(window, pickedHex().c_str());
+                    g_app.ui.showToast("Copied " + pickedHex());
+                } else if (!g_app.folder.currentPath().empty()) {
+                    glfwSetClipboardString(window, g_app.folder.currentPath().c_str());
+                    g_app.ui.showToast("Path copied");
+                }
+                return;
+            }
+            if (act == "revealInFolder") {
+                auto res = silverfileops::revealInFileManager(g_app.folder.currentPath());
+                g_app.ui.showToast(res.ok ? "Opened folder" : "Could not open folder");
+                return;
+            }
+            if (act == "openExternally") {
+                auto res = silverfileops::openWithDefaultApp(g_app.folder.currentPath());
+                g_app.ui.showToast(res.ok ? "Opened externally" : "Could not open");
+                return;
+            }
+            if (act == "colorPicker") {
+                g_app.colorPickerActive = !g_app.colorPickerActive;
+                g_app.pickValid = false;
+                g_app.ui.showToast(g_app.colorPickerActive
+                                       ? "Colour picker on (" + g_app.hotkeys.label("copyPath") + " copies)"
+                                       : "Colour picker off");
+                g_app.redrawPending = true;
+                return;
+            }
+            if (act == "invertColors") {
+                g_app.invertColors = !g_app.invertColors;
+                g_app.ui.showToast(g_app.invertColors ? "Colours inverted" : "Colours normal");
+                g_app.redrawPending = true;
+                return;
+            }
+            if (act.rfind("channel", 0) == 0) {
+                const char* label = "All channels";
+                if      (act == "channelRed")   { g_app.channelMask = 1; label = "Red channel";   }
+                else if (act == "channelGreen") { g_app.channelMask = 2; label = "Green channel"; }
+                else if (act == "channelBlue")  { g_app.channelMask = 4; label = "Blue channel";  }
+                else if (act == "channelAlpha") { g_app.channelMask = 8; label = "Alpha channel"; }
+                else                            { g_app.channelMask = 7; }
+                g_app.ui.showToast(label);
+                g_app.redrawPending = true;
+                return;
+            }
+            if (act == "cycleZoomMode") {
+                g_app.zoomMode = (ZoomMode)(((int)g_app.zoomMode + 1) % 6);
+                SilverConfig::get().setText("viewer.zoomMode", zoomModeKey(g_app.zoomMode));
+                SilverConfig::get().save();
+                fitToWindow();
+                g_app.ui.showToast(std::string("Zoom mode: ") + zoomModeName(g_app.zoomMode));
+                return;
+            }
+            if (act == "slideshowToggle") { slideshowToggle(); return; }
+            if (act == "slideshowPause" && g_app.slideshowActive) {
+                g_app.slideshowPaused = !g_app.slideshowPaused;
+                g_app.ui.showToast(g_app.slideshowPaused ? "Slideshow paused" : "Slideshow resumed");
+                return;
+            }
+            // An action bound but not handled here falls through to the older
+            // shortcuts below rather than being swallowed.
+        }
+    }
+
 
     // Crop & Edit Mode Active Shortcuts
     if (g_app.ui.cropState.active) {
@@ -909,9 +1211,17 @@ int main(int argc, char* argv[]) {
     std::cout << "Starting SilverViewer FilePilot (Linux / Wayland / Multi-Threaded Engine)...\n";
 
     // Shared JSON config drives spacing, timings and animation switches.
+    // Shuffle and the random slide interval both use rand(); unseeded it would
+    // replay the identical sequence on every launch.
+    srand((unsigned)time(nullptr));
+
     SilverConfig::get().init(argv[0]);
     silveranim::reloadFromConfig();
+    g_app.zoomMode = zoomModeFromName(SilverConfig::get().text("viewer.zoomMode", "fit"));
+    g_app.hotkeys.load(SilverConfig::get(), "hotkeys", viewerActions());
     silvercodec::gifMaxFrames() = std::max(1, SilverConfig::get().integer("gif.maxFrames", 300));
+    silvercodec::colorManagementEnabled() =
+        SilverConfig::get().flag("rendering.colorManagement", true);
     silvercodec::gifMaxBytes()  = (size_t)std::max(8, SilverConfig::get().integer("gif.maxDecodeMegabytes", 256))
                                   * 1024ull * 1024ull;
 
@@ -1091,6 +1401,12 @@ int main(int argc, char* argv[]) {
         silveranim::drive(g_app.scale, g_app.scaleVel, g_app.targetScale, tf, dt, 0.0005f);
         silveranim::drivePos(g_app.rotation, g_app.rotationVel, g_app.targetRotation, tf, dt);
 
+        if (g_app.slideshowActive && !g_app.slideshowPaused && !g_app.ui.isGridView) {
+            g_app.slideshowRemaining -= dt;
+            g_app.redrawPending = true;   // the countdown has to keep repainting
+            if (g_app.slideshowRemaining <= 0.0f) slideshowAdvance();
+        }
+
         bool isZoomedIn = (g_app.targetScale > g_app.fitScale * 1.05f);
         g_app.ui.update(dt, isZoomedIn, g_app.folder.count(), g_app.isFullscreen);
 
@@ -1142,7 +1458,8 @@ int main(int argc, char* argv[]) {
                     g_app.scale, curRotInt,
                     activeBgMode, g_app.pixelGrid,
                     visibleTextureId,
-                    flipH, flipV
+                    flipH, flipV,
+                    g_app.invertColors, g_app.channelMask
                 );
             }
         }
@@ -1164,6 +1481,62 @@ int main(int argc, char* argv[]) {
             g_app.preloader.isCurrentLoading.load(),
             visibleTextureId
         );
+        // Slideshow countdown.
+        if (g_app.slideshowActive && SilverConfig::get().flag("slideshow.showCountdown", true)) {
+            FontRenderer& f = g_app.ui.font;
+            const ThemePalette& pal = g_app.ui.theme.current;
+            const float k = g_app.ui.uiScale;
+            char buf[48];
+            if (g_app.slideshowPaused) snprintf(buf, sizeof(buf), "Paused");
+            else snprintf(buf, sizeof(buf), "%.0fs", std::max(0.0f, g_app.slideshowRemaining) + 0.5f);
+
+            float pad = 12.0f * k;
+            float w = f.measureText(buf) + pad * 2.0f;
+            float h = f.textHeight() + pad;
+            float x = (float)g_app.windowW - w - 20.0f * k;
+            float y = 20.0f * k;
+            f.beginBatch();
+            f.addRoundedRect(x, y, w, h, h * 0.5f, pal.menuBg.withAlpha(0.92f));
+            f.addTextCenteredIn(x, y, w, h, buf, pal.textPrimary);
+            f.render(g_app.windowW, g_app.windowH);
+        }
+
+        // Colour picker readout, drawn last so no panel covers it.
+        if (g_app.colorPickerActive && g_app.pickValid) {
+            FontRenderer& f = g_app.ui.font;
+            const ThemePalette& pal = g_app.ui.theme.current;
+            const float k = g_app.ui.uiScale;
+
+            std::string hex = pickedHex();
+            char rgb[64];
+            snprintf(rgb, sizeof(rgb), "rgb(%d, %d, %d)  %d,%d",
+                     g_app.pickR, g_app.pickG, g_app.pickB, g_app.pickX, g_app.pickY);
+
+            float pad = 10.0f * k;
+            float sw = 28.0f * k;
+            float lineH = f.textHeight() + 4.0f * k;
+            float boxW = std::max(f.measureText(hex), f.measureText(rgb)) + sw + pad * 3.0f;
+            float boxH = lineH * 2.0f + pad * 2.0f;
+
+            // Keep the readout on screen and out from under the cursor.
+            float bx = (float)g_app.mouseX + 18.0f * k;
+            float by = (float)g_app.mouseY + 18.0f * k;
+            if (bx + boxW > g_app.windowW) bx = (float)g_app.mouseX - boxW - 18.0f * k;
+            if (by + boxH > g_app.windowH) by = (float)g_app.mouseY - boxH - 18.0f * k;
+
+            f.beginBatch();
+            f.addRoundedRect(bx, by, boxW, boxH, 8.0f * k, pal.menuBg.withAlpha(0.97f));
+            f.addRoundedBorder(bx, by, boxW, boxH, 8.0f * k, 1.0f, pal.menuBorder);
+            f.addRoundedRect(bx + pad, by + (boxH - sw) * 0.5f, sw, sw, 5.0f * k,
+                             Color4(g_app.pickR / 255.0f, g_app.pickG / 255.0f,
+                                    g_app.pickB / 255.0f, 1.0f));
+            f.addRoundedBorder(bx + pad, by + (boxH - sw) * 0.5f, sw, sw, 5.0f * k, 1.0f,
+                               pal.menuBorder);
+            f.addTextVCentered(bx + pad * 2.0f + sw, by + pad, lineH, hex, pal.textPrimary);
+            f.addTextVCentered(bx + pad * 2.0f + sw, by + pad + lineH, lineH, rgb, pal.textSecondary);
+            f.render(g_app.windowW, g_app.windowH);
+        }
+
         g_app.ui.font.endFrame();
 
         glfwSwapBuffers(g_app.window);

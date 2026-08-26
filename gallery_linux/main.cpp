@@ -31,6 +31,7 @@
 #include "silver_constants.h"
 #include "db.h"
 #include "scanner.h"
+#include "silver_fileops.h"
 #include "timeline.h"
 #include "gallery_ui.h"
 
@@ -72,8 +73,13 @@ static void refreshRecords() {
     bool onlyStarred = (g_gal.ui.currentTab == TAB_FAVORITES);
     std::string fFilter = g_gal.ui.activeFolderFilter;
 
+    const SilverConfig& cfg = SilverConfig::get();
+    auto sortField = GalleryDatabase::sortFieldFromKey(cfg.text("library.sortBy", "taken"));
+    bool ascending = cfg.flag("library.sortAscending", false);
+
     g_gal.currentRecords = g_gal.db.fetchAllSorted(g_gal.ui.searchQuery, onlyStarred, fFilter,
-                                                  g_gal.ui.folderFilterRecursive);
+                                                  g_gal.ui.folderFilterRecursive,
+                                                  sortField, ascending);
     g_gal.ui.invalidateDbCache();
     float gridW = g_gal.ui.gridWidth((float)g_gal.windowW);
     bool hasBanner = (!g_gal.ui.activeFolderFilter.empty() && g_gal.ui.currentTab != TAB_FOLDERS);
@@ -85,6 +91,40 @@ static std::vector<std::string> collectAllPaths() {
     all.reserve(g_gal.currentRecords.size());
     for (const auto& rec : g_gal.currentRecords) all.push_back(rec.path);
     return all;
+}
+
+// After a file leaves the library, the record list and timeline have to be
+// rebuilt, and anything looking at the removed photo has to move somewhere
+// valid - otherwise the lightbox sits on a path that no longer exists.
+static void advanceAfterRemoval(const std::string& removedPath) {
+    GalleryUI& ui = g_gal.ui;
+    bool wasFullscreen = ui.isFullScreenView;
+
+    // Pick the neighbour before the list is rebuilt underneath us.
+    std::string nextPath;
+    for (size_t i = 0; i < g_gal.currentRecords.size(); ++i) {
+        if (g_gal.currentRecords[i].path != removedPath) continue;
+        if (i + 1 < g_gal.currentRecords.size())      nextPath = g_gal.currentRecords[i + 1].path;
+        else if (i > 0)                               nextPath = g_gal.currentRecords[i - 1].path;
+        break;
+    }
+
+    ui.selectedPath.clear();
+    ui.highResPreview.unload();
+    ui.fullResLoader.clear();
+    refreshRecords();
+
+    if (nextPath.empty()) {
+        ui.isFullScreenView = false;
+        return;
+    }
+    if (wasFullscreen) {
+        ui.openFullScreenForPath(nextPath, -1, g_gal.currentRecords, g_gal.timeline);
+        return;
+    }
+    for (const GalleryRecord& rec : g_gal.currentRecords) {
+        if (rec.path == nextPath) { ui.selectPhoto(rec, g_gal.timeline); break; }
+    }
 }
 
 static void launchViewer(const std::string& path) {
@@ -291,7 +331,7 @@ static void mouseButtonCallback(GLFWwindow* window, int button, int action, int 
             g_gal.ui.fsOrigPanY = g_gal.ui.fsPanY;
         } else if (action == GLFW_RELEASE) {
             g_gal.isMouseDown = false;
-            g_gal.ui.handleMouseUp();
+            g_gal.ui.handleMouseUp(g_gal.timeline);
         }
         return;
     }
@@ -377,7 +417,7 @@ static void mouseButtonCallback(GLFWwindow* window, int button, int action, int 
             }
         } else if (action == GLFW_RELEASE) {
             g_gal.isMouseDown = false;
-            g_gal.ui.handleMouseUp();
+            g_gal.ui.handleMouseUp(g_gal.timeline);
         }
     }
 }
@@ -732,9 +772,16 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
             }
         } else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_F || key == GLFW_KEY_SPACE) {
             if (!g_gal.currentRecords.empty()) {
-                int index = g_gal.timeline.selectedFlatIndex >= 0
-                          ? g_gal.timeline.selectedFlatIndex : 0;
-                g_gal.ui.openFullScreen(index, g_gal.currentRecords, g_gal.timeline);
+                // selectedFlatIndex counts the timeline's grouped order, so it
+                // cannot be used to index currentRecords directly.
+                int flat = g_gal.timeline.selectedFlatIndex;
+                if (flat >= 0 && flat < (int)g_gal.timeline.flatAllItems.size()) {
+                    g_gal.ui.openFullScreenForPath(
+                        g_gal.timeline.flatAllItems[(size_t)flat]->record.path,
+                        flat, g_gal.currentRecords, g_gal.timeline);
+                } else {
+                    g_gal.ui.openFullScreen(0, g_gal.currentRecords, g_gal.timeline);
+                }
             }
         } else if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) {
             float gridW = g_gal.ui.gridWidth((float)g_gal.windowW);
@@ -775,6 +822,44 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
         } else if ((mods & GLFW_MOD_CONTROL) &&
                    key >= GLFW_KEY_1 && key < GLFW_KEY_1 + kGalleryTabCount) {
             switchTab((GalleryTab)(key - GLFW_KEY_1));
+        } else if (key == GLFW_KEY_DELETE) {
+            // Trash, not unlink: a mis-keyed delete on a photo library should be
+            // recoverable from the desktop's own trash.
+            const std::string path = g_gal.ui.selectedPath;
+            if (!path.empty()) {
+                bool permanent = (mods & GLFW_MOD_SHIFT) != 0;
+                auto res = permanent ? silverfileops::deletePermanently(path)
+                                     : silverfileops::moveToTrash(path);
+                if (res.ok) {
+                    g_gal.db.deletePaths({ path });
+                    g_gal.ui.toast(permanent ? "Deleted permanently" : "Moved to trash");
+                    advanceAfterRemoval(path);
+                } else {
+                    g_gal.ui.toast("Delete failed: " + res.error);
+                }
+            }
+        } else if (key == GLFW_KEY_C && (mods & GLFW_MOD_CONTROL)) {
+            if (!g_gal.ui.selectedPath.empty()) {
+                glfwSetClipboardString(window, g_gal.ui.selectedPath.c_str());
+                g_gal.ui.toast("Path copied");
+            }
+        } else if (key == GLFW_KEY_E && (mods & GLFW_MOD_CONTROL)) {
+            if (!g_gal.ui.selectedPath.empty()) {
+                auto res = silverfileops::revealInFileManager(g_gal.ui.selectedPath);
+                g_gal.ui.toast(res.ok ? "Opened folder" : "Could not open folder");
+            }
+        } else if (key == GLFW_KEY_O && (mods & GLFW_MOD_CONTROL)) {
+            if (!g_gal.ui.selectedPath.empty()) {
+                auto res = silverfileops::openWithDefaultApp(g_gal.ui.selectedPath);
+                g_gal.ui.toast(res.ok ? "Opened externally" : "Could not open");
+            }
+        } else if (key == GLFW_KEY_I) {
+            if (g_gal.ui.isFullScreenView) g_gal.ui.toggleFsInspector();
+        } else if (key == GLFW_KEY_H) {
+            g_gal.ui.toggleCaptionBackground();
+            g_gal.ui.themeToastText = g_gal.ui.showCaptionBackground
+                ? "Caption background: on" : "Caption background: off";
+            g_gal.ui.themeToastTimer = silveranim::rates().toastSeconds;
         } else if (key == GLFW_KEY_T) {
             g_gal.ui.theme.cycleThemeMode();
             g_gal.ui.themeToastText = "Theme: " + g_gal.ui.theme.getThemeModeName();
@@ -814,6 +899,8 @@ int main(int argc, char* argv[]) {
         g_gal.showThumbStats = (tstats && tstats[0] == '1');
     }
     silvercodec::gifMaxFrames() = std::max(1, SilverConfig::get().integer("gif.maxFrames", 300));
+    silvercodec::colorManagementEnabled() =
+        SilverConfig::get().flag("rendering.colorManagement", true);
     silvercodec::gifMaxBytes()  = (size_t)std::max(8, SilverConfig::get().integer("gif.maxDecodeMegabytes", 256))
                                   * 1024ull * 1024ull;
     std::cout << "Config: " << SilverConfig::get().sourcePath << std::endl;
@@ -932,6 +1019,23 @@ int main(int argc, char* argv[]) {
         g_gal.font.applyTextConfig();
         g_gal.iconAtlas.applyConfig();
         g_gal.timeline.applyConfig();
+
+        // Sorting is a database question, so it needs a re-query rather than a
+        // relayout. Only when it actually changed: every other settings tweak
+        // would otherwise re-read the whole library.
+        {
+            const SilverConfig& cfg = SilverConfig::get();
+            static std::string lastSort = "taken";
+            static bool lastAsc = false;
+            std::string sortNow = cfg.text("library.sortBy", "taken");
+            bool ascNow = cfg.flag("library.sortAscending", false);
+            if (sortNow != lastSort || ascNow != lastAsc) {
+                lastSort = sortNow;
+                lastAsc = ascNow;
+                refreshRecords();
+                return;   // refreshRecords already rebuilt the timeline
+            }
+        }
         float gridW = g_gal.ui.gridWidth((float)g_gal.windowW);
         bool hasBanner = (!g_gal.ui.activeFolderFilter.empty() && g_gal.ui.currentTab != TAB_FOLDERS);
         g_gal.ui.relayoutKeepingAnchor(g_gal.timeline, gridW, hasBanner,

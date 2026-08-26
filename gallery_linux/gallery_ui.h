@@ -13,6 +13,8 @@
 #include "silver_config.h"
 #include "silver_anim.h"
 #include "silver_settings.h"
+#include "material/material.h"
+#include "silver_platform.h"
 #include "silver_constants.h"
 #include <vector>
 #include <string>
@@ -110,12 +112,13 @@ struct GalleryLayout {
     float scrubHandleH = 30.0f;
     float scrubTopMargin = 40.0f;
     float scrubBottomMargin = 80.0f;
-    float scrubRadius = 4.0f;
 
     // zoom HUD
     float zoomPopupW = 208.0f;
     float zoomPopupH = 214.0f;
     float zoomPopupRadius = 10.0f;
+    float menuRadius = 8.0f;      // dropdown / theme menu container
+    float pillRadius = 9999.0f;   // floating status + zoom pills
     float zoomAutoCloseSeconds = 3.5f;
 
     // Every metric here is multiplied by the UI scale, so raising the font size
@@ -123,7 +126,10 @@ struct GalleryLayout {
     // overflow the boxes it sits in.
     float uiScale = 1.0f;
 
-    void load() {
+    // Corner radii come from the active theme's shape scale rather than from
+    // individual config numbers, so switching themes restyles every corner at
+    // once. theme.overrides.shape.* is the knob for tuning them.
+    void load(const ThemeTokens& tk) {
         const SilverConfig& c = SilverConfig::get();
         uiScale = silverUiScale();
         const float k = uiScale;
@@ -135,7 +141,7 @@ struct GalleryLayout {
         zoomPillBottomMargin   = c.num("layout.zoomPillBottomMargin", 18.0f);
         zoomPillRightMargin    = c.num("layout.zoomPillRightMargin", 20.0f);
 
-        tileRadius        = c.num("grid.tileRadius", 8.0f);
+        tileRadius        = tk.shape.medium;
         tileImagePad      = c.num("grid.tileImagePadding", 2.0f);
         hoverLift         = c.num("grid.hoverLift", 3.5f);
         shadowOffset      = c.num("grid.shadowOffset", 2.0f);
@@ -151,14 +157,14 @@ struct GalleryLayout {
         folderGap         = c.num("folders.gap", 16.0f);
         folderCardW       = c.num("folders.cardWidth", 280.0f);
         folderCardH       = c.num("folders.cardHeight", 80.0f);
-        folderCardRadius  = c.num("folders.cardRadius", 10.0f);
+        folderCardRadius  = tk.shape.medium;
         folderCardBorderW = c.num("folders.cardBorderWidth", 1.0f);
         folderIconSize    = c.num("folders.iconSize", 32.0f);
 
         sbPreviewH        = c.num("sidebar.previewHeight", 190.0f);
-        sbPreviewRadius   = c.num("sidebar.previewRadius", 8.0f);
+        sbPreviewRadius   = tk.shape.medium;
         sbButtonH         = std::max(40.0f, c.num("sidebar.buttonHeight", 40.0f));
-        sbButtonRadius    = c.num("sidebar.buttonRadius", 6.0f);
+        sbButtonRadius    = tk.shape.full;   // stadium, as Expressive buttons are
         sbMetaRowH        = c.num("sidebar.metaRowHeight", 24.0f);
         sbPathLineH       = c.num("sidebar.pathLineHeight", 20.0f);
         sbPathMaxLines    = std::max(1, c.integer("sidebar.pathMaxLines", 6));
@@ -174,11 +180,12 @@ struct GalleryLayout {
         scrubHandleH      = c.num("scrollbar.handleHeight", 30.0f);
         scrubTopMargin    = c.num("scrollbar.topMargin", 40.0f);
         scrubBottomMargin = c.num("scrollbar.bottomMargin", 80.0f);
-        scrubRadius       = c.num("scrollbar.radius", 4.0f);
 
         zoomPopupW           = c.num("zoom.popupWidth", 208.0f);
         zoomPopupH           = c.num("zoom.popupHeight", 214.0f);
-        zoomPopupRadius      = c.num("zoom.popupRadius", 10.0f);
+        zoomPopupRadius      = tk.shape.large;
+        menuRadius           = tk.shape.medium;
+        pillRadius           = tk.shape.full;
         zoomAutoCloseSeconds = c.num("zoom.autoCloseSeconds", 3.5f);
 
         if (k != 1.0f) scaleAll(k);
@@ -195,8 +202,8 @@ struct GalleryLayout {
             &sbPreviewH, &sbPreviewRadius, &sbButtonH, &sbButtonRadius,
             &sbMetaRowH, &sbPathLineH, &sbSectionSpacing,
             &fsTopBarH, &fsImageMargin, &fsArrowSize, &fsButtonSize,
-            &scrubW, &scrubHandleH, &scrubTopMargin, &scrubBottomMargin, &scrubRadius,
-            &zoomPopupW, &zoomPopupH, &zoomPopupRadius,
+            &scrubW, &scrubHandleH, &scrubTopMargin, &scrubBottomMargin,
+            &zoomPopupW, &zoomPopupH, &zoomPopupRadius, &menuRadius, &pillRadius,
         };
         for (float* m : metrics) *m *= k;
     }
@@ -208,6 +215,9 @@ public:
     GalleryTab currentTab = TAB_ALL;
     std::string searchQuery;
     std::string activeFolderFilter;
+    // H toggles the caption scrim behind filenames on the grid. Some libraries
+    // read better with the photo unobstructed.
+    bool showCaptionBackground = true;
     bool folderFilterRecursive = false;   // include subfolders
     bool isSearching = false;
 
@@ -219,6 +229,19 @@ public:
 
     // Mobile / Desktop In-Gallery Full-Screen Mode
     bool isFullScreenView = false;
+    // Screen rect of the grid tile the lightbox grew from, so opening and
+    // closing morph between the tile and the fitted image instead of scaling
+    // about the window centre.
+    float fsOriginX = 0.0f, fsOriginY = 0.0f, fsOriginW = 0.0f, fsOriginH = 0.0f;
+    bool fsHasOrigin = false;
+    float lastWindowH = 0.0f;
+
+    // Inspector inside the lightbox. The gallery no longer has a side panel, so
+    // this is where a file's details live - toggled with I, like the viewer.
+    bool showFsInspector = false;
+    float fsInspectorAnim = 0.0f;
+    float fsInspectorVel = 0.0f;
+    float fsInspectorPrevTarget = 0.0f;
     int fullScreenIndex = 0;
     float fsZoom = 1.0f;
     float fsPanX = 0.0f;
@@ -512,6 +535,7 @@ public:
         if (scrollbarAlpha > eps && scrollbarAlpha < 1.0f) return true;
         if (moving(sidebarAnim, (showSidebar && !selectedPath.empty()) ? 1.0f : 0.0f)) return true;
         if (moving(fsAnim, isFullScreenView ? 1.0f : 0.0f)) return true;
+        if (moving(fsInspectorAnim, (isFullScreenView && showFsInspector) ? 1.0f : 0.0f)) return true;
         if (moving(zoomPopupAnim, (showZoomPopup || isDraggingZoomSlider) ? 1.0f : 0.0f)) return true;
         if (moving(themeMenuAnim, showThemeMenu ? 1.0f : 0.0f)) return true;
         if (moving(shortcutsAnim, showShortcuts ? 1.0f : 0.0f)) return true;
@@ -611,7 +635,12 @@ public:
 
     // Re-read every metric from the JSON config (also called on hot reload).
     void applyConfig() {
-        L.load();
+        // GalleryUI is constructed before main() calls SilverConfig::init(), so
+        // the constructor's theme.init() only ever sees defaults. main calls
+        // applyConfig() once the config is loaded, and again on hot-reload.
+        theme.applyConfig();
+        showCaptionBackground = SilverConfig::get().flag("grid.captionBackground", true);
+        L.load(theme.tokens());
         sidebarWidth = L.sidebarWidth;
 
         const float k = L.uiScale;
@@ -621,7 +650,8 @@ public:
         settingsSearchH = 52.0f * k;
         settingsFooterH = 38.0f * k;
         settingsCtrlW   = 200.0f * k;
-        silveranim::reloadFromConfig();
+        // Theme supplies each channel's default spring; config still overrides.
+        silveranim::reloadFromConfig(&theme.tokens().motion);
         thumbs.applyConfig();
         fullResLoader.maxDecodeEdge = SilverConfig::get().integer(
             "thumbnails.previewMaxEdge", silver::defaults::fullResolutionDecode);
@@ -676,14 +706,20 @@ public:
         }
 
         // 2. Sidebar slide animation
+        //
+        // The selection is deliberately NOT cleared here any more. Dropping it
+        // when the slide settled was the inspector's teardown; now that the
+        // inspector never opens, that condition is true on every frame and it
+        // wiped selectedPath the instant the fullscreen view set it - leaving
+        // the lightbox with no path to look a texture up by.
         float targetSb = (showSidebar && !selectedPath.empty()) ? 1.0f : 0.0f;
         silveranim::driveTrackedFade(sidebarAnim, sidebarVel, sidebarPrevTarget, targetSb, anim.chSidebar, dt);
-        if (sidebarAnim == targetSb && !showSidebar) {
-            selectedPath.clear();
-        }
 
         // 3. Fullscreen lightbox transition animation
         silveranim::driveTrackedFade(fsAnim, fsVel, fsPrevTarget, isFullScreenView ? 1.0f : 0.0f, anim.chFullscreen, dt);
+        float targetInsp = (isFullScreenView && showFsInspector) ? 1.0f : 0.0f;
+        silveranim::driveTrackedFade(fsInspectorAnim, fsInspectorVel, fsInspectorPrevTarget,
+                                     targetInsp, anim.chSidebar, dt);
 
         // 4. Zoom Popup HUD animation & auto-close timer
         if (zoomPopupAutoCloseTimer > 0.0f) {
@@ -898,7 +934,6 @@ public:
     void selectPhoto(const GalleryRecord& rec, TimelineManager& timeline, float windowH = 0.0f) {
         selectedPath = rec.path;
         selectedRecord = rec;
-        showSidebar = true;
         timeline.selectItem(rec.path);
         thumbs.requestThumbnail(rec.path, true);
 
@@ -906,6 +941,44 @@ public:
             const auto* itm = timeline.flatAllItems[timeline.selectedFlatIndex];
             scrollToItem(itm->y, itm->h, timeline.totalContentHeight, windowH);
         }
+    }
+
+    // flatIndex counts positions in the timeline's grouped order, which is not
+    // the order of `records`. Resolving by path keeps the opened photo, its
+    // title and its neighbours consistent no matter how the grid is grouped.
+    int recordIndexForPath(const std::vector<GalleryRecord>& records,
+                           const std::string& path, int hint) const {
+        if (hint >= 0 && hint < (int)records.size() && records[(size_t)hint].path == path)
+            return hint;
+        for (size_t i = 0; i < records.size(); ++i)
+            if (records[i].path == path) return (int)i;
+        return -1;
+    }
+
+    void openFullScreenForPath(const std::string& path, int hint,
+                               const std::vector<GalleryRecord>& records,
+                               TimelineManager& timeline) {
+        int idx = recordIndexForPath(records, path, hint);
+        if (idx >= 0) openFullScreen(idx, records, timeline);
+    }
+
+    // The tile's on-screen rect for the current selection. Recomputed on open
+    // and again on close, because paging inside the lightbox changes which tile
+    // the image should fly back to.
+    void captureFullScreenOrigin(TimelineManager& timeline) {
+        float windowH = lastWindowH > 0.0f ? lastWindowH : 1080.0f;
+        fsHasOrigin = false;
+        if (selectedPath.empty()) return;
+        const TimelineItem* itm = timeline.findItem(selectedPath);
+        if (!itm) return;
+        float sx = itm->animX;
+        float sy = itm->animY - scrollY;
+        // A tile scrolled far out of view would fly in from off-screen, which
+        // reads as a glitch rather than a connection. Fall back to a plain scale.
+        if (sy + itm->animH < -itm->animH || sy > windowH + itm->animH) return;
+        fsOriginX = sx; fsOriginY = sy;
+        fsOriginW = itm->animW; fsOriginH = itm->animH;
+        fsHasOrigin = (fsOriginW > 1.0f && fsOriginH > 1.0f);
     }
 
     void openFullScreen(int index, const std::vector<GalleryRecord>& records, TimelineManager& timeline) {
@@ -929,6 +1002,7 @@ public:
         if (index - 1 >= 0)
             nearby.push_back(records[(size_t)(index - 1)].path);
         fullResLoader.updatePreloadPaths(nearby);
+        captureFullScreenOrigin(timeline);
     }
 
     GalleryUIAction handleMouseDown(float mx, float my, TimelineManager& timeline,
@@ -1310,6 +1384,9 @@ public:
             float starX = curX + curW - starSize - 6.0f;
             float starY = (curY - scrollY) + 6.0f;
 
+            // Held tiles morph their corners while pressed (Material Expressive).
+            timeline.pressedPath = itm->record.path;
+
             if (isInside(mx, my, starX, starY, starSize, starSize)) {
                 act.type = GalleryUIAction::TOGGLE_STAR;
                 act.targetPath = itm->record.path;
@@ -1324,7 +1401,7 @@ public:
                 double nowSec = std::chrono::duration<double>(now.time_since_epoch()).count();
                 if (itm->flatIndex == lastClickIndex && (nowSec - lastClickTimeSec) < 0.35) {
                     // Double click: open directly in full-screen in-gallery lightbox!
-                    openFullScreen(itm->flatIndex, records, timeline);
+                    openFullScreenForPath(itm->record.path, itm->flatIndex, records, timeline);
                     act.type = GalleryUIAction::OPEN_FULLSCREEN;
                     lastClickIndex = -1;
                     lastClickTimeSec = 0.0;
@@ -1333,15 +1410,11 @@ public:
                 lastClickIndex = itm->flatIndex;
                 lastClickTimeSec = nowSec;
 
-                // Single click: Select and open in FilePilot right sidebar (or fullscreen on narrow screens)
-                if (windowW < 750.0f) {
-                    openFullScreen(itm->flatIndex, records, timeline);
-                    act.type = GalleryUIAction::OPEN_FULLSCREEN;
-                } else {
-                    selectPhoto(itm->record, timeline);
-                    act.type = GalleryUIAction::SELECT_IMAGE;
-                    act.targetPath = itm->record.path;
-                }
+                // A single click opens the photo. The gallery is for browsing;
+                // inspecting a file belongs to the viewer, which has the room
+                // for metadata that a grid sidebar never did.
+                openFullScreenForPath(itm->record.path, itm->flatIndex, records, timeline);
+                act.type = GalleryUIAction::OPEN_FULLSCREEN;
                 return act;
             }
         }
@@ -1489,7 +1562,8 @@ public:
         }
     }
 
-    void handleMouseUp() {
+    void handleMouseUp(TimelineManager& timeline) {
+        timeline.pressedPath.clear();
         if (settingsDraggingSlider) {
             settingsDraggingSlider = false;
             settingsDragRow = -1;
@@ -1504,6 +1578,8 @@ public:
                 TimelineManager& timeline, GalleryDatabase& db, GalleryScanner& scanner,
                 FontRenderer& font, IconAtlas& iconAtlas,
                 const std::vector<GalleryRecord>& records) {
+        lastWindowH = (float)windowH;
+        if (isFullScreenView || fsAnim > 0.001f) captureFullScreenOrigin(timeline);
         const ThemePalette& pal = theme.current;
 
         // -------------------------------------------------------------
@@ -1625,6 +1701,11 @@ public:
 
                 if (ry + rh < topBarH || ry > windowH) continue;
 
+                // While the lightbox transition runs this tile's photo is the
+                // thing flying across the screen, so the slot is left empty
+                // rather than drawing the same image twice.
+                if (fsAnim > 0.01f && fsHasOrigin && itm->record.path == selectedPath) continue;
+
                 // Smooth hover lift motion
                 float lift = itm->hoverAnim * L.hoverLift;
                 rx -= lift * 0.5f;
@@ -1632,11 +1713,15 @@ public:
                 rw += lift;
                 rh += lift;
 
+                // Expressive: a held tile pulls its corners in. pressAnim is already
+                // spring-driven, so the morph costs no extra animation state.
+                const float tileR = theme.pressedRadius(L.tileRadius, itm->pressAnim);
+
                 // Tile Background / Animated Elevation Shadow
                 font.beginBatch();
                 float shadowAlpha = L.shadowAlpha + L.shadowHoverAlpha * itm->hoverAnim;
-                font.addRoundedRect(rx + L.shadowOffset, ry + L.shadowOffset + lift, rw, rh, L.tileRadius, Color4(0, 0, 0, shadowAlpha));
-                font.addRoundedRect(rx, ry, rw, rh, L.tileRadius, pal.cardBg);
+                font.addRoundedRect(rx + L.shadowOffset, ry + L.shadowOffset + lift, rw, rh, tileR, Color4(0, 0, 0, shadowAlpha));
+                font.addRoundedRect(rx, ry, rw, rh, tileR, pal.cardBg);
                 font.render(windowW, windowH);
 
                 // Thumbnail Texture with Aspect-Fill UV Calculation
@@ -1693,7 +1778,7 @@ public:
 
                     font.beginBatch();
                     font.addRoundedBorder(ix, iy, iw, ih,
-                                          std::max(0.0f, L.tileRadius - pad),
+                                          std::max(0.0f, tileR - pad),
                                           1.0f, imageOutline(pal));
                     font.render(windowW, windowH);
                 } else if (GLuint prev = previewTextureFor(itm->record)) {
@@ -1720,10 +1805,10 @@ public:
                     // Nothing cached yet: breathing skeleton.
                     float pulse = silveranim::pulse((float)glfwGetTime());
                     font.beginBatch();
-                    Color4 skelCol = pal.isDark ? Color4::Hex(0x1F222C, pulse * 0.9f) : Color4::Hex(0xE5E7EB, pulse * 0.9f);
+                    Color4 skelCol = pal.chipIdle.withAlpha(pulse * 0.9f);
                     font.addRoundedRect(rx + L.tileImagePad, ry + L.tileImagePad,
                                         rw - L.tileImagePad * 2.0f, rh - L.tileImagePad * 2.0f,
-                                        L.tileRadius * 0.75f, skelCol);
+                                        tileR * 0.75f, skelCol);
                     font.render(windowW, windowH);
                 }
 
@@ -1732,7 +1817,7 @@ public:
                 if (activeBorderAlpha > 0.01f) {
                     font.beginBatch();
                     float bThickness = itm->selectAnim > 0.5f ? L.selBorderW : L.hoverBorderW;
-                    font.addRoundedBorder(rx, ry, rw, rh, L.tileRadius, bThickness, Color4(pal.accent.r, pal.accent.g, pal.accent.b, activeBorderAlpha));
+                    font.addRoundedBorder(rx, ry, rw, rh, tileR, bThickness, Color4(pal.accent.r, pal.accent.g, pal.accent.b, activeBorderAlpha));
                     font.render(windowW, windowH);
                 }
 
@@ -1741,13 +1826,22 @@ public:
                     float capH = std::max(L.captionH, font.textHeight() + 12.0f);
                     float capY = ry + rh - capH;
 
-                    font.beginBatch();
-                    font.addRoundedRect(rx, capY, rw, capH, L.tileRadius, Color4(0, 0, 0, 0.72f * itm->hoverAnim));
-                    font.render(windowW, windowH);
+                    if (showCaptionBackground) {
+                        font.beginBatch();
+                        font.addRoundedRect(rx, capY, rw, capH, tileR,
+                                            theme.tokens().color.scrim.withAlpha(0.72f * itm->hoverAnim));
+                        font.render(windowW, windowH);
+                    }
 
                     font.beginBatch();
                     float capPad = 8.0f * L.uiScale;
                     std::string fName = fitTextWithEllipsis(font, itm->record.filename, rw - capPad * 2.0f);
+                    if (!showCaptionBackground) {
+                        // No scrim: the label needs its own contrast against
+                        // whatever the photo happens to be.
+                        font.addTextVCentered(rx + capPad + 1.0f, capY + 1.0f, capH, fName,
+                                              theme.tokens().color.scrim.withAlpha(0.75f * itm->hoverAnim));
+                    }
                     font.addTextVCentered(rx + capPad, capY, capH, fName,
                                           Color4(1.0f, 1.0f, 1.0f, itm->hoverAnim));
                     font.render(windowW, windowH);
@@ -1765,7 +1859,7 @@ public:
                     // theme's own scrim so the badge sits on the palette.
                     Color4 idleBadge = pal.isDark ? Color4(0.0f, 0.0f, 0.0f, 0.55f * starAlpha)
                                                   : Color4(1.0f, 1.0f, 1.0f, 0.85f * starAlpha);
-                    Color4 sBg = itm->record.starred ? Color4::Hex(0xEF4444, 0.95f * starAlpha) : idleBadge;
+                    Color4 sBg = itm->record.starred ? pal.starBadge.withAlpha(0.95f * starAlpha) : idleBadge;
                     font.addRoundedRect(starX, starY, starSize, starSize, 13.0f, sBg);
                     font.render(windowW, windowH);
 
@@ -1876,12 +1970,16 @@ public:
                     browseShowAllRect.isHovered = isInside(mouseX, mouseY, bx, browseShowAllRect.y, bw, browseShowAllRect.h);
 
                     font.beginBatch();
-                    font.addRoundedRect(bx, browseShowAllRect.y, bw, browseShowAllRect.h, 5.0f,
-                                        browseShowAllRect.isHovered ? pal.accent : pal.btnBg);
+                    material::Interaction showAllIn;
+                    showAllIn.hovered = browseShowAllRect.isHovered;
+                    font.addRoundedRect(bx, browseShowAllRect.y, bw, browseShowAllRect.h,
+                                        theme.tokens().shape.small,
+                                        material::withState(pal.btnBg, theme.tokens().color.onSurface,
+                                                            theme.tokens().state, showAllIn));
                     font.render(windowW, windowH);
                     font.beginBatch();
                     font.addTextCenteredIn(bx, browseShowAllRect.y, bw, browseShowAllRect.h, label,
-                                           browseShowAllRect.isHovered ? Color4(1, 1, 1, 1) : pal.textPrimary);
+                                           theme.tokens().color.onSurface);
                     font.render(windowW, windowH);
                 } else {
                     browseShowAllRect = UIRect();
@@ -2037,8 +2135,10 @@ public:
         font.beginBatch();
         font.addHorizontalEdgeShadow(topBarH, 0.0f, (float)windowW, 6.0f * L.uiScale,
                                      pal.isDark ? 0.28f : 0.12f, /*towardUp=*/false);
-        font.addRect(0, 0, (float)windowW, topBarH, pal.barBg);
-        font.addRect(0, topBarH - 1.0f, (float)windowW, 1.0f, pal.cardBorder);
+        // Material raises the bar onto a higher container tier and adds a
+        // hairline only once content scrolls beneath it.
+        material::drawAppBar(font, material::Rect{ 0.0f, 0.0f, (float)windowW, topBarH },
+                             theme.tokens(), scrollY > 1.0f);
         font.render(windowW, windowH);
 
         // 1. Right Controls (Scan / Rescan + Theme Toggle)
@@ -2060,18 +2160,33 @@ public:
         scanBtnRect.isHovered = isInside(mouseX, mouseY, scanBtnRect.x, scanBtnRect.y, btnSize, btnSize);
         themeBtnRect.isHovered = isInside(mouseX, mouseY, themeBtnRect.x, themeBtnRect.y, btnSize, btnSize);
 
+        // Circular icon buttons. The active theme button becomes tonal rather
+        // than a primary fill: primary's on-colour is dark in a dark theme, so
+        // the white glyph it used to draw was unreadable there.
+        material::Interaction scanIn;
+        scanIn.hovered = scanBtnRect.isHovered;
+        material::Interaction themeIn;
+        themeIn.hovered = themeBtnRect.isHovered;
+        themeIn.selected = showThemeMenu;
+
         font.beginBatch();
-        if (scanBtnRect.isHovered) font.addRoundedRect(scanBtnRect.x, scanBtnRect.y, btnSize, btnSize, 6.0f * L.uiScale, pal.btnHover);
-        if (showThemeMenu || themeBtnRect.isHovered) font.addRoundedRect(themeBtnRect.x, themeBtnRect.y, btnSize, btnSize, 6.0f * L.uiScale, showThemeMenu ? pal.accent : pal.btnHover);
+        Color4 scanContent = material::drawIconButton(
+            font, material::Rect{ scanBtnRect.x, scanBtnRect.y, btnSize, btnSize },
+            material::ButtonVariant::Text, theme.tokens(), scanIn);
+        Color4 themeContent = material::drawIconButton(
+            font, material::Rect{ themeBtnRect.x, themeBtnRect.y, btnSize, btnSize },
+            showThemeMenu ? material::ButtonVariant::Tonal : material::ButtonVariant::Text,
+            theme.tokens(), themeIn);
         font.render(windowW, windowH);
 
         font.beginBatch();
         float topIconS = 20.0f * L.uiScale;
         float topIconPad = (btnSize - topIconS) * 0.5f;
         iconAtlas.drawIcon(font, ICON_REFRESH, scanBtnRect.x + topIconPad, scanBtnRect.y + topIconPad, topIconS, topIconS,
-                           scanner.isScanning.load() ? pal.accent : pal.textPrimary);
+                           scanner.isScanning.load() ? pal.accent : scanContent);
         iconAtlas.drawIcon(font, theme.isDarkMode.load() ? ICON_THEME_LIGHT : ICON_THEME_DARK,
-                           themeBtnRect.x + topIconPad, themeBtnRect.y + topIconPad, topIconS, topIconS, showThemeMenu ? Color4(1, 1, 1, 1) : pal.textPrimary);
+                           themeBtnRect.x + topIconPad, themeBtnRect.y + topIconPad, topIconS, topIconS,
+                           themeContent);
         font.render(windowW, windowH, 0, iconAtlas.textureId);
 
         // 2. Left App Logo & Title (Responsive)
@@ -2119,8 +2234,10 @@ public:
         float tabX = leftBoundary + (availTabSpace - totalTabW) * 0.5f;
 
         font.beginBatch();
-        font.addRoundedRect(tabX, tabY, totalTabW, tabH, 8.0f, pal.cardBg);
-        font.addRoundedBorder(tabX, tabY, totalTabW, tabH, 8.0f, 1.0f, pal.cardBorder);
+        const material::ThemeTokens& tk = theme.tokens();
+        float tabGroupR = tabH * 0.5f;   // stadium, as a segmented control is
+        font.addRoundedRect(tabX, tabY, totalTabW, tabH, tabGroupR, tk.color.surfaceContainerLowest);
+        font.addRoundedBorder(tabX, tabY, totalTabW, tabH, tabGroupR, 1.0f, tk.color.outline);
         font.render(windowW, windowH);
 
         // Pre-compute tab rects
@@ -2138,7 +2255,8 @@ public:
         // 1. Draw smoothly animated sliding active indicator pill
         if (tabAnimW > 0.0f) {
             font.beginBatch();
-            font.addRoundedRect(tabAnimX, tabY + 3.0f, tabAnimW, tabH - 6.0f, 6.0f, pal.accent);
+            font.addRoundedRect(tabAnimX, tabY + 3.0f, tabAnimW, tabH - 6.0f,
+                                (tabH - 6.0f) * 0.5f, material::roleSelected(tk.color).container);
             font.render(windowW, windowH);
         }
 
@@ -2148,12 +2266,19 @@ public:
 
             if (!isSel && tabRects[i].isHovered) {
                 font.beginBatch();
-                font.addRoundedRect(tabRects[i].x, tabRects[i].y, tabRects[i].w, tabRects[i].h, 6.0f, pal.btnHover);
+                font.addRoundedRect(tabRects[i].x, tabRects[i].y, tabRects[i].w, tabRects[i].h,
+                                    tabRects[i].h * 0.5f,
+                                    Color4::overlay(tk.color.surfaceContainerLowest,
+                                                    tk.color.onSurface, tk.state.hover));
                 font.render(windowW, windowH);
             }
 
             font.beginBatch();
-            Color4 textCol = isSel ? Color4(1, 1, 1, 1) : (tabRects[i].isHovered ? pal.textPrimary : pal.textSecondary);
+            // The indicator is secondaryContainer, so its label must be that
+            // role's on-colour rather than a hardcoded white.
+            Color4 textCol = isSel ? material::roleSelected(tk.color).content
+                                   : (tabRects[i].isHovered ? tk.color.onSurface
+                                                            : tk.color.onSurfaceVariant);
             font.addTextCenteredIn(tabRects[i].x, tabRects[i].y, tabRects[i].w, tabRects[i].h,
                                    activeTabNames[i], textCol);
             font.render(windowW, windowH);
@@ -2220,18 +2345,20 @@ public:
             zoomPillBtnRect.isHovered = isInside(mouseX, mouseY, pillX, pillY, pillW, pillH);
 
             font.beginBatch();
-            font.addRoundedRect(pillX + 2, pillY + 2, pillW, pillH, 8.0f, Color4(0, 0, 0, 0.35f));
+            font.addRoundedRect(pillX + 2, pillY + 2, pillW, pillH, L.pillRadius, Color4(0, 0, 0, 0.35f));
             if (showZoomPopup || zoomPillBtnRect.isHovered) {
-                font.addRoundedRect(pillX, pillY, pillW, pillH, 8.0f, pal.accent);
+                font.addRoundedRect(pillX, pillY, pillW, pillH, L.pillRadius, pal.accent);
             } else {
-                font.addRoundedRect(pillX, pillY, pillW, pillH, 8.0f, pal.toastBg);
-                font.addRoundedBorder(pillX, pillY, pillW, pillH, 8.0f, 1.0f, pal.toastBorder);
+                font.addRoundedRect(pillX, pillY, pillW, pillH, L.pillRadius, pal.toastBg);
+                font.addRoundedBorder(pillX, pillY, pillW, pillH, L.pillRadius, 1.0f, pal.toastBorder);
             }
             font.render(windowW, windowH);
 
             font.beginBatch();
             font.addTextCenteredIn(pillX, pillY, pillW, pillH, pctBuf,
-                                   (showZoomPopup || zoomPillBtnRect.isHovered) ? Color4(1, 1, 1, 1) : pal.textPrimary);
+                                   (showZoomPopup || zoomPillBtnRect.isHovered)
+                                       ? material::rolePrimary(theme.tokens().color).content
+                                       : pal.textPrimary);
             font.render(windowW, windowH);
 
             // 3. Zoom Popup HUD / Menu & Vertical Slider (Smooth Slide-Up & Alpha Fade)
@@ -2294,9 +2421,9 @@ public:
 
                 // Background & Shadow
                 font.beginBatch();
-                font.addRoundedRect(popX + 3, popY + 4, popW, popH, 10.0f, Color4(0, 0, 0, 0.50f * popupAlpha));
-                font.addRoundedRect(popX, popY, popW, popH, 10.0f, pal.isDark ? Color4::Hex(0x181A20, 0.98f * popupAlpha) : Color4::Hex(0xFFFFFF, 0.98f * popupAlpha));
-                font.addRoundedBorder(popX, popY, popW, popH, 10.0f, 1.2f, pal.isDark ? Color4::Hex(0x2D323E, popupAlpha) : Color4::Hex(0xE0E3E8, popupAlpha));
+                font.addRoundedRect(popX + 3, popY + 4, popW, popH, L.zoomPopupRadius, Color4(0, 0, 0, 0.50f * popupAlpha));
+                font.addRoundedRect(popX, popY, popW, popH, L.zoomPopupRadius, pal.menuBg.withAlpha(0.98f * popupAlpha));
+                font.addRoundedBorder(popX, popY, popW, popH, L.zoomPopupRadius, 1.2f, pal.menuBorder.withAlpha(popupAlpha));
                 font.render(windowW, windowH);
 
                 // FilePilot-style compact title bar: the component explains
@@ -2322,8 +2449,7 @@ public:
                 const float dividerY = popY + popupPad + headerH;
                 font.addRect(popX + popupPad, dividerY,
                              popW - popupPad * 2.0f, std::max(1.0f, L.uiScale),
-                             pal.isDark ? Color4::Hex(0x303540, 0.75f * popupAlpha)
-                                        : Color4::Hex(0xE4E7EC, 0.90f * popupAlpha));
+                             (pal.isDark ? pal.divider.withAlpha(0.75f * popupAlpha) : pal.divider.withAlpha(0.90f * popupAlpha)));
                 font.render(windowW, windowH);
 
                 // Preset List (Left column)
@@ -2355,21 +2481,20 @@ public:
 
                     bool isActive = (timeline.currentPreset == pi.preset);
 
-                    if (isActive || pi.rect->isHovered) {
-                        font.beginBatch();
-                        // Everything inside the popup has to fade with it -
-                        // using the raw accent left active rows fully opaque
-                        // while the card behind them dissolved.
-                        Color4 accentFaded(pal.accent.r, pal.accent.g, pal.accent.b, pal.accent.a * popupAlpha);
-                        Color4 bgCol = isActive ? accentFaded
-                                                : (pal.isDark ? Color4::Hex(0x252830, 0.90f * popupAlpha)
-                                                              : Color4::Hex(0xEEF0F4, 0.90f * popupAlpha));
-                        font.addRoundedRect(itemX, curItemY, itemW, itemH, 6.0f, bgCol);
-                        font.render(windowW, windowH);
-                    }
+                    // A selected row is secondaryContainer with its own on-colour.
+                    // Filling it with `primary` and writing white on top is only
+                    // legible when primary is dark, which it is not in a dark theme.
+                    font.beginBatch();
+                    material::Interaction rowIn;
+                    rowIn.selected = isActive;
+                    rowIn.hovered = pi.rect->isHovered;
+                    Color4 rowContent = material::drawListItem(
+                        font, material::Rect{ itemX, curItemY, itemW, itemH },
+                        theme.tokens(), rowIn, theme.tokens().shape.small, popupAlpha);
+                    font.render(windowW, windowH);
 
                     // Icon
-                    Color4 iconCol = isActive ? Color4(1, 1, 1, popupAlpha)
+                    Color4 iconCol = isActive ? rowContent
                                               : fade(pi.rect->isHovered ? pal.textPrimary : pal.textSecondary, popupAlpha);
                     font.beginBatch();
                     float presetIcon = 18.0f * L.uiScale;
@@ -2379,7 +2504,7 @@ public:
                     font.render(windowW, windowH, 0, iconAtlas.textureId);
 
                     // Text
-                    Color4 textCol = isActive ? Color4(1, 1, 1, popupAlpha)
+                    Color4 textCol = isActive ? rowContent
                                               : fade(pal.textPrimary, popupAlpha);
                     font.beginBatch();
                     font.addTextVCentered(itemX + 32.0f * L.uiScale, curItemY, itemH, pi.label, textCol);
@@ -2415,10 +2540,9 @@ public:
                 // if it floats over the menu commands.
                 font.addRoundedRect(laneX, trackY, sliderLaneW,
                                     trackH, 7.0f * L.uiScale,
-                                    pal.isDark ? Color4::Hex(0x14171D, 0.62f * popupAlpha)
-                                               : Color4::Hex(0xF2F4F7, 0.90f * popupAlpha));
+                                    (pal.isDark ? pal.wellBg.withAlpha(0.62f * popupAlpha) : pal.wellBg.withAlpha(0.90f * popupAlpha)));
                 // Rail background
-                Color4 railBg = pal.isDark ? Color4::Hex(0x2A2E38, popupAlpha) : Color4::Hex(0xDFE2E8, popupAlpha);
+                Color4 railBg = pal.divider.withAlpha(popupAlpha);
                 font.addRoundedRect(trackX, trackY, trackW, trackH, 3.0f, railBg);
 
                 // Blue track fill from bottom up to thumbY
@@ -2440,43 +2564,40 @@ public:
                 font.beginBatch();
                 font.addRect(popX + popupPad, chipY - footerPadY,
                              popW - popupPad * 2.0f, std::max(1.0f, L.uiScale),
-                             pal.isDark ? Color4::Hex(0x303540, 0.75f * popupAlpha)
-                                        : Color4::Hex(0xE4E7EC, 0.90f * popupAlpha));
+                             (pal.isDark ? pal.divider.withAlpha(0.75f * popupAlpha) : pal.divider.withAlpha(0.90f * popupAlpha)));
                 font.render(windowW, windowH);
 
-                // Give every chip its natural width, then share any slack evenly
-                // so the row still fills the popup.
-                float chipsAvail = popW - popupPad * 2.0f - chipGap * 3.0f;
-                float chipExtra = std::max(0.0f, chipsAvail - chipsNatural) * 0.25f;
+                // A Material segmented button: one connected container with a
+                // shared outline and hairline dividers, not four loose chips.
+                std::vector<float> natural((size_t)4);
+                for (int gi = 0; gi < 4; ++gi) natural[(size_t)gi] = chipLabelW[gi] + chipPadX * 2.0f;
 
-                float chipX = popX + popupPad;
+                material::Rect groupRect{ popX + popupPad, chipY, popW - popupPad * 2.0f, chipH };
+                std::vector<material::Segment> segs =
+                    material::layoutSegments(groupRect, &natural, 4);
+
+                std::vector<std::string> segLabels((size_t)4);
                 for (int gi = 0; gi < 4; ++gi) {
-                    float chipW = chipLabelW[gi] + chipPadX * 2.0f + chipExtra;
-                    groupRects[gi].x = chipX;
-                    groupRects[gi].y = chipY - (popY - popTargetY); // hit-test at the settled position
-                    groupRects[gi].w = chipW;
-                    groupRects[gi].h = chipH;
-                    groupRects[gi].isHovered = isInside(mouseX, mouseY, groupRects[gi].x, groupRects[gi].y, chipW, chipH);
+                    material::Segment& sg = segs[(size_t)gi];
+                    groupRects[gi].x = sg.rect.x;
+                    groupRects[gi].y = sg.rect.y - (popY - popTargetY); // hit-test at the settled position
+                    groupRects[gi].w = sg.rect.w;
+                    groupRects[gi].h = sg.rect.h;
+                    groupRects[gi].isHovered =
+                        isInside(mouseX, mouseY, groupRects[gi].x, groupRects[gi].y, sg.rect.w, sg.rect.h);
 
-                    bool isActiveGroup = ((int)timeline.grouping == gi);
-
-                    font.beginBatch();
-                    Color4 chipAccent(pal.accent.r, pal.accent.g, pal.accent.b, pal.accent.a * popupAlpha);
-                    Color4 chipBg = isActiveGroup ? chipAccent
-                                  : (groupRects[gi].isHovered ? (pal.isDark ? Color4::Hex(0x252830, 0.95f * popupAlpha) : Color4::Hex(0xEEF0F4, 0.95f * popupAlpha))
-                                                             : (pal.isDark ? Color4::Hex(0x1D2029, 0.85f * popupAlpha) : Color4::Hex(0xF4F6F9, 0.90f * popupAlpha)));
-                    font.addRoundedRect(chipX, chipY, chipW, chipH, 6.0f, chipBg);
-                    font.render(windowW, windowH);
-
-
-                    font.beginBatch();
-                    Color4 chipText = isActiveGroup ? Color4(1, 1, 1, popupAlpha)
-                                                    : fade(pal.textSecondary, popupAlpha);
-                    font.addTextCenteredIn(chipX, chipY, chipW, chipH, kGroupLabels[gi], chipText);
-                    font.render(windowW, windowH);
-
-                    chipX += chipW + chipGap;
+                    sg.in.selected = ((int)timeline.grouping == gi);
+                    sg.in.hovered = groupRects[gi].isHovered;
+                    segLabels[(size_t)gi] = kGroupLabels[gi];
                 }
+
+                font.beginBatch();
+                material::drawSegmentedButton(font, segs, theme.tokens(), popupAlpha);
+                font.render(windowW, windowH);
+
+                font.beginBatch();
+                material::drawSegmentedLabels(font, segs, segLabels, theme.tokens(), popupAlpha);
+                font.render(windowW, windowH);
             } else {
                 for (int gi = 0; gi < 4; ++gi) groupRects[gi] = UIRect();
             }
@@ -2593,9 +2714,9 @@ public:
 
             // Background & Shadow
             font.beginBatch();
-            font.addRoundedRect(tmX + 3, tmY + 4, tmW, tmH, 8.0f, Color4(0, 0, 0, 0.50f * tmAlpha));
-            font.addRoundedRect(tmX, tmY, tmW, tmH, 8.0f, pal.isDark ? Color4::Hex(0x181A20, 0.98f * tmAlpha) : Color4::Hex(0xFFFFFF, 0.98f * tmAlpha));
-            font.addRoundedBorder(tmX, tmY, tmW, tmH, 8.0f, 1.0f, pal.isDark ? Color4::Hex(0x2D323E, tmAlpha) : Color4::Hex(0xDFE2E8, tmAlpha));
+            font.addRoundedRect(tmX + 3, tmY + 4, tmW, tmH, L.menuRadius, Color4(0, 0, 0, 0.50f * tmAlpha));
+            font.addRoundedRect(tmX, tmY, tmW, tmH, L.menuRadius, pal.menuBg.withAlpha(0.98f * tmAlpha));
+            font.addRoundedBorder(tmX, tmY, tmW, tmH, L.menuRadius, 1.0f, pal.menuBorder.withAlpha(tmAlpha));
             font.render(windowW, windowH);
 
             // 3 Options: System, Dark, Light
@@ -2626,23 +2747,27 @@ public:
 
                 bool isActive = (theme.mode.load() == to.m);
 
+                Color4 tmRowContent = material::roleSelected(theme.tokens().color)
+                                          .content.withAlpha(tmAlpha);
                 if (isActive || to.rect->isHovered) {
                     font.beginBatch();
-                    Color4 bgCol = isActive ? fade(pal.accent, tmAlpha)
-                                            : (pal.isDark ? Color4::Hex(0x282B34, 0.85f * tmAlpha)
-                                                          : Color4::Hex(0xEEF0F4, 0.85f * tmAlpha));
-                    font.addRoundedRect(optX, optY, optW, optH, 6.0f, bgCol);
+                    material::Interaction tmIn;
+                    tmIn.selected = isActive;
+                    tmIn.hovered = to.rect->isHovered;
+                    tmRowContent = material::drawListItem(
+                        font, material::Rect{ optX, optY, optW, optH }, theme.tokens(), tmIn,
+                        theme.tokens().shape.small, tmAlpha);
                     font.render(windowW, windowH);
                 }
 
-                Color4 iconCol = isActive ? Color4(1, 1, 1, tmAlpha)
+                Color4 iconCol = isActive ? tmRowContent
                                           : fade(to.rect->isHovered ? pal.textPrimary : pal.textSecondary, tmAlpha);
                 font.beginBatch();
                 float optIconS = 18.0f * L.uiScale;
                 iconAtlas.drawIcon(font, to.icon, optX + 8.0f * L.uiScale, optY + (optH - optIconS) * 0.5f, optIconS, optIconS, iconCol);
                 font.render(windowW, windowH, 0, iconAtlas.textureId);
 
-                Color4 textCol = isActive ? Color4(1, 1, 1, tmAlpha) : fade(pal.textPrimary, tmAlpha);
+                Color4 textCol = isActive ? tmRowContent : fade(pal.textPrimary, tmAlpha);
                 font.beginBatch();
                 font.addTextVCentered(optX + 32.0f * L.uiScale, optY, optH, to.label, textCol);
                 font.render(windowW, windowH);
@@ -2732,6 +2857,41 @@ public:
     // save() deliberately records its own mtime so the hot-reload poll does not
     // re-read the file we just wrote - which means nothing else will apply the
     // change for us, and this has to do it all.
+    void toggleFsInspector() { showFsInspector = !showFsInspector; }
+
+    void toast(const std::string& text) {
+        themeToastText = text;
+        themeToastTimer = silveranim::rates().toastSeconds;
+    }
+
+    static std::string formatBytes(int64_t bytes) {
+        char buf[48];
+        if (bytes >= 1024LL * 1024LL * 1024LL)
+            snprintf(buf, sizeof(buf), "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+        else if (bytes >= 1024LL * 1024LL)
+            snprintf(buf, sizeof(buf), "%.2f MB", (double)bytes / (1024.0 * 1024.0));
+        else if (bytes >= 1024LL)
+            snprintf(buf, sizeof(buf), "%.1f KB", (double)bytes / 1024.0);
+        else
+            snprintf(buf, sizeof(buf), "%lld B", (long long)bytes);
+        return buf;
+    }
+
+    static std::string formatStamp(int64_t epoch) {
+        if (epoch <= 0) return "Unknown";
+        std::tm tmv{};
+        if (!silverplat::localTime((std::time_t)epoch, tmv)) return "Unknown";
+        char buf[64];
+        strftime(buf, sizeof(buf), "%d %b %Y, %H:%M", &tmv);
+        return buf;
+    }
+
+    void toggleCaptionBackground() {
+        showCaptionBackground = !showCaptionBackground;
+        SilverConfig::get().setFlag("grid.captionBackground", showCaptionBackground);
+        SilverConfig::get().save();
+    }
+
     void applySettingsLive() {
         applyConfig();
         if (onConfigChanged) onConfigChanged();
@@ -2789,11 +2949,11 @@ public:
         font.beginBatch();
         font.addRoundedRect(cardX + 3, cardY + 6, cardW, cardH, 12.0f, Color4(0, 0, 0, 0.5f * a));
         font.addRoundedRect(cardX, cardY, cardW, cardH, 12.0f,
-                            pal.isDark ? Color4::Hex(0x16181E, 0.99f * a) : Color4::Hex(0xFFFFFF, 0.99f * a));
+                            pal.panelBg.withAlpha(0.99f * a));
         font.addRoundedBorder(cardX, cardY, cardW, cardH, 12.0f, 1.2f,
-                              pal.isDark ? Color4::Hex(0x2D323E, a) : Color4::Hex(0xE0E3E8, a));
+                              pal.menuBorder.withAlpha(a));
         font.addRect(cardX, cardY + searchH - 1.0f, cardW, 1.0f,
-                     pal.isDark ? Color4::Hex(0x2D323E, a) : Color4::Hex(0xE6E9EE, a));
+                     pal.menuBorder.withAlpha(a));
         font.render(windowW, windowH);
 
         // Search row
@@ -2854,7 +3014,7 @@ public:
             if (isCursor || row.isHovered) {
                 font.beginBatch();
                 Color4 bg = isCursor
-                    ? (pal.isDark ? Color4::Hex(0x1E2430, 0.95f * a) : Color4::Hex(0xEEF3FB, 0.9f * a))
+                    ? ((pal.isDark ? pal.accentSoft.withAlpha(0.95f * a) : pal.accentSoft.withAlpha(0.9f * a)))
                     : Color4(pal.btnHover.r, pal.btnHover.g, pal.btnHover.b, 0.5f * a);
                 font.addRoundedRect(row.x, row.y, row.w, row.h, 7.0f, bg);
                 if (isCursor) {
@@ -2905,7 +3065,7 @@ public:
         float footY = cardY + cardH - footerH;
         font.beginBatch();
         font.addRect(cardX, footY, cardW, 1.0f,
-                     pal.isDark ? Color4::Hex(0x2D323E, a) : Color4::Hex(0xE6E9EE, a));
+                     pal.menuBorder.withAlpha(a));
         font.render(windowW, windowH);
 
         struct Hint { const char* key; const char* what; };
@@ -2920,7 +3080,7 @@ public:
             float kw = font.measureText(h.key) + 14.0f * L.uiScale;
             font.beginBatch();
             font.addRoundedRect(hx, chipY, kw, chipH, 4.0f,
-                                pal.isDark ? Color4::Hex(0x252A34, a) : Color4::Hex(0xEDEFF3, a));
+                                pal.rowHover.withAlpha(a));
             font.render(windowW, windowH);
             font.beginBatch();
             font.addTextCenteredIn(hx, chipY, kw, chipH, h.key,
@@ -2951,14 +3111,23 @@ public:
                 settingsCtrlRects[index] = c;
 
                 bool on = settingFlag(spec);
+                const material::ThemeColors& tc = theme.tokens().color;
                 font.beginBatch();
-                Color4 track = on ? Color4(pal.accent.r, pal.accent.g, pal.accent.b, a)
-                                  : (pal.isDark ? Color4::Hex(0x3A404C, a) : Color4::Hex(0xCBD2DA, a));
+                // Material's switch: the knob takes the track's on-colour when
+                // on, and the outline colour when off. A hardcoded white knob
+                // vanishes against a light track in a light theme.
+                Color4 track = on ? tc.primary.withAlpha(tc.primary.a * a)
+                                  : tc.surfaceContainerHighest.withAlpha(a);
                 font.addRoundedRect(c.x, c.y, tw, th, th * 0.5f, track);
+                if (!on)
+                    font.addRoundedBorder(c.x, c.y, tw, th, th * 0.5f, std::max(1.0f, 2.0f * k),
+                                          tc.outline.withAlpha(tc.outline.a * a));
                 float inset = 3.0f * k;
                 float knob = th - inset * 2.0f;
                 float kx = on ? (c.x + tw - knob - inset) : (c.x + inset);
-                font.addRoundedRect(kx, c.y + inset, knob, knob, knob * 0.5f, Color4(1, 1, 1, a));
+                Color4 knobCol = on ? tc.onPrimary : tc.outline;
+                font.addRoundedRect(kx, c.y + inset, knob, knob, knob * 0.5f,
+                                    knobCol.withAlpha(knobCol.a * a));
                 font.render(windowW, windowH);
                 break;
             }
@@ -2970,7 +3139,7 @@ public:
                 settingsCtrlRects[index] = c;
 
                 font.beginBatch();
-                Color4 fieldBg = pal.isDark ? Color4::Hex(0x22262F, a) : Color4::Hex(0xF1F3F7, a);
+                Color4 fieldBg = pal.chipIdle.withAlpha(a);
                 font.addRoundedRect(c.x, c.y, totalW, bh, 6.0f, fieldBg);
                 font.render(windowW, windowH);
 
@@ -3000,7 +3169,7 @@ public:
 
                 font.beginBatch();
                 font.addRoundedRect(c.x, centerY - sh * 0.5f, sw, sh, sh * 0.5f,
-                                    pal.isDark ? Color4::Hex(0x3A404C, a) : Color4::Hex(0xD7DDE5, a));
+                                    pal.outlineStrong.withAlpha(a));
                 font.addRoundedRect(c.x, centerY - sh * 0.5f, sw * t, sh, sh * 0.5f,
                                     Color4(pal.accent.r, pal.accent.g, pal.accent.b, a));
                 float knob = 16.0f * k;
@@ -3018,13 +3187,14 @@ public:
 
                 bool open = (settingsOpenChoice == (int)index);
                 font.beginBatch();
-                Color4 bg = (open || c.isHovered) ? Color4(pal.accent.r, pal.accent.g, pal.accent.b, a)
-                                                  : (pal.isDark ? Color4::Hex(0x22262F, a) : Color4::Hex(0xF1F3F7, a));
-                font.addRoundedRect(c.x, c.y, bw2, bh2, 6.0f, bg);
+                material::Pair ctrlRole = (open || c.isHovered)
+                    ? material::roleTonal(theme.tokens().color)
+                    : material::Pair{ pal.chipIdle, theme.tokens().color.onSurface };
+                font.addRoundedRect(c.x, c.y, bw2, bh2, theme.tokens().shape.small,
+                                    ctrlRole.container.withAlpha(ctrlRole.container.a * a));
                 font.render(windowW, windowH);
 
-                Color4 fg = (open || c.isHovered) ? Color4(1, 1, 1, a)
-                                                  : Color4(pal.textPrimary.r, pal.textPrimary.g, pal.textPrimary.b, a);
+                Color4 fg = ctrlRole.content.withAlpha(ctrlRole.content.a * a);
                 font.beginBatch();
                 font.addTextCenteredIn(c.x, c.y, bw2 - 18.0f * k, bh2, settingDisplayValue(spec), fg);
                 font.render(windowW, windowH);
@@ -3056,9 +3226,9 @@ public:
         font.beginBatch();
         font.addRoundedRect(anchor.x + 2, menuY + 3, anchor.w, menuH, 8.0f, Color4(0, 0, 0, 0.45f));
         font.addRoundedRect(anchor.x, menuY, anchor.w, menuH, 8.0f,
-                            pal.isDark ? Color4::Hex(0x1D2129, 1.0f) : Color4::Hex(0xFFFFFF, 1.0f));
+                            pal.menuBg.withAlpha(1.0f));
         font.addRoundedBorder(anchor.x, menuY, anchor.w, menuH, 8.0f, 1.0f,
-                              pal.isDark ? Color4::Hex(0x333A47, 1.0f) : Color4::Hex(0xDDE1E8, 1.0f));
+                              pal.outlineStrong.withAlpha(1.0f));
         font.render(windowW, windowH);
 
         int current = settingChoiceIndex(*spec);
@@ -3069,13 +3239,18 @@ public:
 
             if (hov || sel) {
                 font.beginBatch();
-                Color4 bg = hov ? Color4(pal.accent.r, pal.accent.g, pal.accent.b, 1.0f)
-                                : (pal.isDark ? Color4::Hex(0x252A34, 1.0f) : Color4::Hex(0xEDF1F7, 1.0f));
-                font.addRoundedRect(anchor.x + 4.0f, iy, anchor.w - 8.0f, itemH, 5.0f, bg);
+                material::Interaction itIn;
+                itIn.hovered = hov;
+                itIn.selected = sel;
+                font.addRoundedRect(anchor.x + 4.0f, iy, anchor.w - 8.0f, itemH,
+                                    theme.tokens().shape.small,
+                                    material::withState(theme.tokens().color.surfaceContainerHigh,
+                                                        theme.tokens().color.onSurface, theme.tokens().state, itIn));
                 font.render(windowW, windowH);
             }
 
-            Color4 fg = hov ? Color4(1, 1, 1, 1) : (sel ? pal.textPrimary : pal.textSecondary);
+            Color4 fg = sel ? theme.tokens().color.onSurface
+                            : (hov ? theme.tokens().color.onSurface : theme.tokens().color.onSurfaceVariant);
             if (sel) {
                 font.beginBatch();
                 iconAtlas.drawIcon(font, ICON_CHECK, anchor.x + 10.0f, iy + 8.0f, 14.0f, 14.0f, fg);
@@ -3142,9 +3317,9 @@ public:
         font.beginBatch();
         font.addRoundedRect(cardX + 3, cardY + 5, cardW, cardH, 12.0f, Color4(0, 0, 0, 0.5f * a));
         font.addRoundedRect(cardX, cardY, cardW, cardH, 12.0f,
-                            pal.isDark ? Color4::Hex(0x181A20, 0.99f * a) : Color4::Hex(0xFFFFFF, 0.99f * a));
+                            pal.menuBg.withAlpha(0.99f * a));
         font.addRoundedBorder(cardX, cardY, cardW, cardH, 12.0f, 1.2f,
-                              pal.isDark ? Color4::Hex(0x2D323E, a) : Color4::Hex(0xE0E3E8, a));
+                              pal.menuBorder.withAlpha(a));
         font.render(windowW, windowH);
 
         font.beginBatch();
@@ -3229,7 +3404,7 @@ public:
         sbPreviewRect.h = prevH;
         sbPreviewRect.isHovered = isInside(mouseX, mouseY, innerX, curY, innerW, prevH);
 
-        Color4 previewMatteBg = pal.isDark ? Color4::Hex(0x0C0D10, 1.0f) : Color4::Hex(0xEAEEF3, 1.0f);
+        Color4 previewMatteBg = pal.wellBg.withAlpha(1.0f);
         font.beginBatch();
         font.addRoundedRect(innerX, curY, innerW, prevH, L.sbPreviewRadius, previewMatteBg);
         font.addRoundedBorder(innerX, curY, innerW, prevH, L.sbPreviewRadius, L.sbBorderW, sbPreviewRect.isHovered ? pal.accent : pal.cardBorder);
@@ -3358,17 +3533,27 @@ public:
 
         font.beginBatch();
         // Fav Button
-        Color4 favBg = selectedRecord.starred ? Color4::Hex(0xEF4444, 0.9f) : (sbFavBtnRect.isHovered ? pal.btnHover : pal.cardBg);
-        font.addRoundedRect(sbFavBtnRect.x, sbFavBtnRect.y, btnW, btnH, 6.0f, favBg);
-        font.addRoundedBorder(sbFavBtnRect.x, sbFavBtnRect.y, btnW, btnH, 6.0f, 1.0f, selectedRecord.starred ? favBg : pal.cardBorder);
+        Color4 favBg = selectedRecord.starred ? pal.starBadge.withAlpha(0.9f) : (sbFavBtnRect.isHovered ? pal.btnHover : pal.cardBg);
+        font.addRoundedRect(sbFavBtnRect.x, sbFavBtnRect.y, btnW, btnH, L.sbButtonRadius, favBg);
+        if (!selectedRecord.starred)
+            font.addRoundedBorder(sbFavBtnRect.x, sbFavBtnRect.y, btnW, btnH, L.sbButtonRadius,
+                                  1.0f, theme.tokens().color.outline);
 
         // Fullscreen Button
-        font.addRoundedRect(sbFullscreenBtnRect.x, sbFullscreenBtnRect.y, btnW, btnH, 6.0f, sbFullscreenBtnRect.isHovered ? pal.btnHover : pal.cardBg);
-        font.addRoundedBorder(sbFullscreenBtnRect.x, sbFullscreenBtnRect.y, btnW, btnH, 6.0f, 1.0f, pal.cardBorder);
+        {
+            material::Interaction bin;
+            bin.hovered = sbFullscreenBtnRect.isHovered;
+            material::drawButton(font, material::Rect{ sbFullscreenBtnRect.x, sbFullscreenBtnRect.y, btnW, btnH },
+                                 material::ButtonVariant::Outlined, theme.tokens(), bin);
+        }
 
         // Viewer Button
-        font.addRoundedRect(sbViewerBtnRect.x, sbViewerBtnRect.y, btnW, btnH, 6.0f, sbViewerBtnRect.isHovered ? pal.btnHover : pal.cardBg);
-        font.addRoundedBorder(sbViewerBtnRect.x, sbViewerBtnRect.y, btnW, btnH, 6.0f, 1.0f, pal.cardBorder);
+        {
+            material::Interaction bin;
+            bin.hovered = sbViewerBtnRect.isHovered;
+            material::drawButton(font, material::Rect{ sbViewerBtnRect.x, sbViewerBtnRect.y, btnW, btnH },
+                                 material::ButtonVariant::Outlined, theme.tokens(), bin);
+        }
         font.render(windowW, windowH);
 
         // Icon + label as one centred group, sized from the actual text. The old
@@ -3397,7 +3582,8 @@ public:
         drawActionButton(sbFavBtnRect,
                          selectedRecord.starred ? ICON_HEART_FILLED : ICON_HEART,
                          selectedRecord.starred ? "Starred" : "Star",
-                         selectedRecord.starred ? Color4(1, 1, 1, 1) : pal.textPrimary);
+                         selectedRecord.starred ? material::roleTertiary(theme.tokens().color).content
+                                                : pal.textPrimary);
         drawActionButton(sbFullscreenBtnRect, ICON_FIT, "View", pal.textPrimary);
         drawActionButton(sbViewerBtnRect, ICON_EXTERNAL_LINK, "Open", pal.textPrimary);
 
@@ -3406,7 +3592,7 @@ public:
         // 4. FilePilot Rich Metadata Cards
         auto renderMetaSection = [&](const std::string& secTitle, const std::vector<std::pair<std::string, std::string>>& entries) {
             font.beginBatch();
-            font.addText(innerX, curY, secTitle, pal.textAccent);
+            font.addText(innerX, curY, secTitle, pal.textSecondary);
             font.render(windowW, windowH);
             curY += 22.0f;
 
@@ -3477,7 +3663,7 @@ public:
         // Section C: Location - full, untruncated path across as many lines as needed
         {
             font.beginBatch();
-            font.addText(innerX, curY, "LOCATION", pal.textAccent);
+            font.addText(innerX, curY, "LOCATION", pal.textSecondary);
             font.render(windowW, windowH);
             curY += 22.0f;
 
@@ -3523,6 +3709,122 @@ public:
     // -----------------------------------------------------------------
     // RENDER: MOBILE / DESKTOP RESPONSIVE FULL-SCREEN IN-APP VIEWER (Animated Lightbox)
     // -----------------------------------------------------------------
+
+    // Properties card for the lightbox: a compact floating panel sized to its
+    // content, not a full-height rail. Labels sit left and values right, which
+    // is what makes a long list of short values scannable.
+    void renderFsInspector(int windowW, int windowH, FontRenderer& font, float anim) {
+        float t = fsInspectorAnim * anim;
+        if (t <= 0.004f) return;
+
+        const material::ThemeTokens& tk = theme.tokens();
+        const material::ThemeColors& tc = tk.color;
+        const float k = L.uiScale;
+        const GalleryRecord& r = selectedRecord;
+
+        // ---- content ------------------------------------------------------
+        struct Row { const char* label; std::string value; };
+        std::vector<Row> head, body;
+
+        head.push_back({ "Path",  r.folder });
+        head.push_back({ "Type",  r.fileType.empty() ? "Unknown" : r.fileType });
+        head.push_back({ "Size",  formatBytes(r.fileSize) });
+
+        body.push_back({ "Date modified", formatStamp(r.modifiedTime) });
+        body.push_back({ "Date created",  formatStamp(r.createdTime) });
+        if (r.captureTime > 0)
+            body.push_back({ "Date taken", formatStamp(r.captureTime) });
+        if (r.width > 0 && r.height > 0) {
+            body.push_back({ "Width",  std::to_string(r.width) + " pixels" });
+            body.push_back({ "Height", std::to_string(r.height) + " pixels" });
+            body.push_back({ "Dimensions", std::to_string(r.width) + " x " + std::to_string(r.height) });
+            char mp[32]; snprintf(mp, sizeof(mp), "%.1f MP",
+                                  (double)r.width * (double)r.height / 1e6);
+            body.push_back({ "Resolution", mp });
+            char ar[32]; snprintf(ar, sizeof(ar), "%.2f : 1",
+                                  (double)r.width / (double)std::max(1, r.height));
+            body.push_back({ "Aspect ratio", ar });
+        }
+        body.push_back({ "Starred", r.starred ? "Yes" : "No" });
+
+        // ---- metrics ------------------------------------------------------
+        float rowH   = font.textHeight() + 8.0f * k;
+        float headH  = font.textHeight() + 18.0f * k;
+        float padX   = 14.0f * k;
+        float gap    = 8.0f * k;
+
+        float panelW = std::clamp((float)windowW * 0.30f, 290.0f * k, 430.0f * k);
+        float wanted = headH + gap + (float)head.size() * rowH
+                     + gap + 1.0f + gap + (float)body.size() * rowH + gap;
+
+        float margin = 16.0f * k;
+        float topBarH = L.fsTopBarH;
+        float availH = (float)windowH - topBarH - margin * 2.0f;
+        float panelH = std::min(wanted, availH);
+
+        // Slides in from the right and settles; only a short travel, since the
+        // card is an overlay rather than a view change.
+        float px = (float)windowW - margin - panelW + (1.0f - t) * 24.0f * k;
+        float py = topBarH + margin;
+
+        material::Rect card{ px, py, panelW, panelH };
+        font.beginBatch();
+        material::drawSurface(font, card, material::SurfaceKind::Menu, tk, t, true);
+        font.render(windowW, windowH);
+
+        float radius = tk.shape.extraSmall;
+
+        // ---- header -------------------------------------------------------
+        font.beginBatch();
+        font.addRoundedRect(px, py, panelW, headH, radius,
+                            tc.secondaryContainer.withAlpha(tc.secondaryContainer.a * t));
+        // Square off the bottom corners so the header meets the body flush.
+        font.addRect(px, py + headH - radius, panelW, radius,
+                     tc.secondaryContainer.withAlpha(tc.secondaryContainer.a * t));
+        font.render(windowW, windowH);
+
+        font.beginBatch();
+        font.addTextVCentered(px + padX, py, headH,
+                              fitTextWithEllipsis(font, r.filename, panelW - padX * 2.0f),
+                              tc.onSecondaryContainer.withAlpha(t));
+        font.render(windowW, windowH);
+
+        float y = py + headH + gap;
+        float labelX = px + padX;
+        float valueRight = px + panelW - padX;
+        float labelW = panelW * 0.40f;
+
+        auto drawRows = [&](const std::vector<Row>& rows) {
+            for (const Row& row : rows) {
+                if (y + rowH > py + panelH) return;
+                font.beginBatch();
+                font.addTextVCentered(labelX, y, rowH, row.label,
+                                      tc.onSurface.withAlpha(t));
+                // Values are right-aligned, so they are measured and placed from
+                // the right edge rather than laid out after the label.
+                float maxValW = valueRight - (labelX + labelW);
+                std::string v = fitTextWithEllipsis(font, row.value, maxValW);
+                font.addTextVCentered(valueRight - font.measureText(v), y, rowH, v,
+                                      tc.onSurfaceVariant.withAlpha(t));
+                font.render(windowW, windowH);
+                y += rowH;
+            }
+        };
+
+        drawRows(head);
+
+        if (y + gap + rowH < py + panelH) {
+            y += gap;
+            font.beginBatch();
+            material::drawDivider(font, labelX, y, panelW - padX * 2.0f, tk,
+                                  std::max(1.0f, k), t);
+            font.render(windowW, windowH);
+            y += gap;
+        }
+
+        drawRows(body);
+    }
+
     void renderFullScreenView(int windowW, int windowH, float mouseX, float mouseY,
                               const std::vector<GalleryRecord>& records,
                               FontRenderer& font, IconAtlas& iconAtlas,
@@ -3531,7 +3833,7 @@ public:
 
         // 1. Dark Backdrop (Smooth Fade)
         font.beginBatch();
-        Color4 bgCol = pal.isDark ? Color4::Hex(0x0A0B0E, 0.98f * anim) : Color4::Hex(0xF3F4F6, 0.98f * anim);
+        Color4 bgCol = pal.wellBg.withAlpha(0.98f * anim);
         font.addRect(0, 0, (float)windowW, (float)windowH, bgCol);
         font.render(windowW, windowH);
 
@@ -3568,6 +3870,35 @@ public:
         float topBarH = L.fsTopBarH;
         float viewH = (float)windowH - topBarH;
 
+        // Why is the fullscreen frame empty? Set SILVER_FS_DEBUG=1 to find out:
+        // this reports which of the three sources produced a texture, and the
+        // dimensions the draw is gated on.
+        {
+            static bool dbg = [](){ const char* e = getenv("SILVER_FS_DEBUG"); return e && e[0] == '1'; }();
+            if (dbg) {
+                static double lastLog = 0.0;
+                double nowS = glfwGetTime();
+                if (nowS - lastLog > 1.0) {
+                    lastLog = nowS;
+                    auto it = thumbs.cache.find(selectedPath);
+                    bool inCache = (it != thumbs.cache.end());
+                    std::cout << "[fs] tex=" << drawTexId
+                              << " imgW=" << imgW << " imgH=" << imgH
+                              << " anim=" << anim
+                              << " highRes=" << (highResMatches ? 1 : 0)
+                              << " hrId=" << highResPreview.id
+                              << " thumbInCache=" << (inCache ? 1 : 0)
+                              << " thumbReady=" << (inCache && it->second.ready ? 1 : 0)
+                              << " thumbTex=" << (inCache ? it->second.texId : 0)
+                              << " atlasSlot=" << (inCache ? it->second.atlasSlot : -2)
+                              << " recW=" << selectedRecord.width
+                              << " recH=" << selectedRecord.height
+                              << " hasPreview=" << (selectedRecord.hasPreview ? 1 : 0)
+                              << " path=" << selectedPath << std::endl;
+                }
+            }
+        }
+
         if (drawTexId && imgW > 0 && imgH > 0) {
             float aspect = (float)imgW / (float)imgH;
             float fitW = (float)windowW - L.fsImageMargin;
@@ -3579,14 +3910,28 @@ public:
                 scaleW = fitH * aspect;
             }
 
-            float motionScale = (0.88f + 0.12f * anim) * fsZoom;
-            scaleW *= motionScale;
-            scaleH *= motionScale;
+            // Fitted destination for the image at full open.
+            float targetW = scaleW * fsZoom;
+            float targetH = scaleH * fsZoom;
+            float targetX = (float)windowW * 0.5f + fsPanX - targetW * 0.5f;
+            float targetY = topBarH + viewH * 0.5f + fsPanY - targetH * 0.5f;
 
-            float cx = (float)windowW * 0.5f + fsPanX;
-            float cy = topBarH + viewH * 0.5f + fsPanY;
-            float ix = cx - scaleW * 0.5f;
-            float iy = cy - scaleH * 0.5f;
+            float ix, iy;
+            if (fsHasOrigin && anim < 0.999f) {
+                // Shared-element transition: the image travels between the grid
+                // tile it came from and its fitted position, so opening and
+                // closing read as the same object moving rather than one view
+                // dissolving into another. Eased out, because the arrival
+                // matters more than the departure.
+                float e = 1.0f - std::pow(1.0f - std::clamp(anim, 0.0f, 1.0f), 3.0f);
+                ix     = fsOriginX + (targetX - fsOriginX) * e;
+                iy     = fsOriginY + (targetY - fsOriginY) * e;
+                scaleW = fsOriginW + (targetW - fsOriginW) * e;
+                scaleH = fsOriginH + (targetH - fsOriginH) * e;
+            } else {
+                ix = targetX; iy = targetY;
+                scaleW = targetW; scaleH = targetH;
+            }
 
             // Keep the settled image bounds on physical pixels. This avoids a
             // half-pixel softness at fractional desktop scales while the image
@@ -3600,24 +3945,55 @@ public:
                 scaleH = bottom - iy;
             }
 
+            // A grid tile is aspect-fill centre-cropped; the fitted image is
+            // aspect-fit. Interpolating the rect between two different aspect
+            // ratios would stretch the photo for the whole flight, so the crop
+            // is animated too: the source is always centre-cropped to whatever
+            // aspect the rect currently has. At the tile end that reproduces
+            // the tile's own crop exactly, at the far end it is the whole
+            // image, and nothing distorts in between.
+            float cu0 = drawU0, cv0 = drawV0, cu1 = drawU1, cv1 = drawV1;
+            if (scaleH > 0.0f && imgH > 0) {
+                float rectAspect = scaleW / scaleH;
+                float imgAspect = (float)imgW / (float)imgH;
+                if (rectAspect > imgAspect) {
+                    float visible = imgAspect / rectAspect;      // fraction of height kept
+                    float pad = (1.0f - visible) * 0.5f;
+                    float span = drawV1 - drawV0;
+                    cv0 = drawV0 + span * pad;
+                    cv1 = drawV1 - span * pad;
+                } else if (imgAspect > rectAspect) {
+                    float visible = rectAspect / imgAspect;      // fraction of width kept
+                    float pad = (1.0f - visible) * 0.5f;
+                    float span = drawU1 - drawU0;
+                    cu0 = drawU0 + span * pad;
+                    cu1 = drawU1 - span * pad;
+                }
+            }
+
+            float imgA = fsHasOrigin ? 1.0f : anim;   // opaque for the whole flight
             font.beginBatch();
             UIVertex v[6] = {
-                { ix, iy, drawU0, drawV0, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix + scaleW, iy, drawU1, drawV0, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix + scaleW, iy + scaleH, drawU1, drawV1, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix, iy, cu0, cv0, 1.0f, 1.0f, 1.0f, imgA, 2.0f },
+                { ix + scaleW, iy, cu1, cv0, 1.0f, 1.0f, 1.0f, imgA, 2.0f },
+                { ix + scaleW, iy + scaleH, cu1, cv1, 1.0f, 1.0f, 1.0f, imgA, 2.0f },
 
-                { ix, iy, drawU0, drawV0, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix + scaleW, iy + scaleH, drawU1, drawV1, 1.0f, 1.0f, 1.0f, anim, 2.0f },
-                { ix, iy + scaleH, drawU0, drawV1, 1.0f, 1.0f, 1.0f, anim, 2.0f },
+                { ix, iy, cu0, cv0, 1.0f, 1.0f, 1.0f, imgA, 2.0f },
+                { ix + scaleW, iy + scaleH, cu1, cv1, 1.0f, 1.0f, 1.0f, imgA, 2.0f },
+                { ix, iy + scaleH, cu0, cv1, 1.0f, 1.0f, 1.0f, imgA, 2.0f },
             };
             font.vertices.insert(font.vertices.end(), v, v + 6);
             font.render(windowW, windowH, drawTexId);
 
-            font.beginBatch();
-            font.addBorder(ix, iy, scaleW, scaleH, 1.0f,
-                           imageOutline(pal, anim));
-            font.render(windowW, windowH);
+            if (!fsHasOrigin || anim >= 0.999f) {
+                font.beginBatch();
+                font.addBorder(ix, iy, scaleW, scaleH, 1.0f,
+                               imageOutline(pal, anim));
+                font.render(windowW, windowH);
+            }
         }
+
+        renderFsInspector(windowW, windowH, font, anim);
 
         // 3. Navigation Arrows (< and >)
         float arrowSize = L.fsArrowSize;
@@ -3723,7 +4099,7 @@ public:
         fsCloseBtnRect.isHovered = isInside(mouseX, mouseY, fsCloseBtnRect.x, fsCloseBtnRect.y, btnS, btnS);
 
         font.beginBatch();
-        Color4 fsFavBg = fade(selectedRecord.starred ? Color4::Hex(0xEF4444, 0.9f)
+        Color4 fsFavBg = fade(selectedRecord.starred ? pal.starBadge.withAlpha(0.9f)
                                                      : (fsFavBtnRect.isHovered ? pal.btnHover : pal.cardBg), anim);
         font.addRoundedRect(fsFavBtnRect.x, fsFavBtnRect.y, btnS, btnS, 8.0f * L.uiScale, fsFavBg);
         if (fsViewerBtnRect.isHovered) font.addRoundedRect(fsViewerBtnRect.x, fsViewerBtnRect.y, btnS, btnS, 8.0f * L.uiScale, fade(pal.btnHover, anim));

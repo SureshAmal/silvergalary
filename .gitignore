@@ -7,3 +7,4 @@ bin/*
 br.bat
 installer/*
 /installer
+include/silver_config_default.h

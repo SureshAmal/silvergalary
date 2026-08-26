@@ -19,6 +19,8 @@ public:
     GLint uBgModeLoc = -1;
     GLint uCheckerSizeLoc = -1;
     GLint uPixelGridLoc = -1;
+    GLint uInvertLoc = -1;
+    GLint uChannelsLoc = -1;
     GLint uTextureLoc = -1;
 
     GLint uBgWinSizeLoc = -1;
@@ -81,6 +83,8 @@ public:
             uniform int uBgMode;
             uniform float uCheckerSize;
             uniform int uPixelGrid;
+            uniform int uInvert;      // 1 = invert RGB
+            uniform int uChannels;    // bitmask: 1=R 2=G 4=B 8=A-as-grey; 7 = normal
 
             out vec4 FragColor;
 
@@ -100,6 +104,33 @@ public:
                 }
 
                 vec4 texColor = texture(uTexture, vUV);
+
+                // Channel isolation. Showing a single channel as greyscale is
+                // what makes it readable; leaving it in its own colour just
+                // produces a red or green wash you cannot judge.
+                if (uChannels != 7 && uChannels != 0) {
+                    if (uChannels == 8) {
+                        texColor.rgb = vec3(texColor.a);
+                        texColor.a = 1.0;
+                    } else {
+                        bool r = (uChannels & 1) != 0;
+                        bool g = (uChannels & 2) != 0;
+                        bool b = (uChannels & 4) != 0;
+                        int count = (r ? 1 : 0) + (g ? 1 : 0) + (b ? 1 : 0);
+                        if (count == 1) {
+                            float v = r ? texColor.r : (g ? texColor.g : texColor.b);
+                            texColor.rgb = vec3(v);
+                        } else {
+                            texColor.rgb = vec3(r ? texColor.r : 0.0,
+                                                g ? texColor.g : 0.0,
+                                                b ? texColor.b : 0.0);
+                        }
+                    }
+                }
+
+                // Inversion happens before compositing, so the checkerboard
+                // behind a transparent image does not invert with it.
+                if (uInvert == 1) texColor.rgb = vec3(1.0) - texColor.rgb;
 
                 // Blend with checkerboard underneath image alpha
                 vec4 bg = getCheckerboard(gl_FragCoord.xy);
@@ -146,6 +177,8 @@ public:
         uBgModeLoc = glGetUniformLocation(program, "uBgMode");
         uCheckerSizeLoc = glGetUniformLocation(program, "uCheckerSize");
         uPixelGridLoc = glGetUniformLocation(program, "uPixelGrid");
+        uInvertLoc = glGetUniformLocation(program, "uInvert");
+        uChannelsLoc = glGetUniformLocation(program, "uChannels");
         uTextureLoc = glGetUniformLocation(program, "uTexture");
 
         // -------------------------------------------------------------
@@ -261,7 +294,8 @@ public:
               float scale, int rotation,
               int bgMode, bool pixelGrid,
               GLuint textureID,
-              bool flipH = false, bool flipV = false) {
+              bool flipH = false, bool flipV = false,
+              bool invert = false, int channelMask = 7) {
         if (!textureID) return;
 
         glUseProgram(program);
@@ -276,6 +310,8 @@ public:
         glUniform1i(uBgModeLoc, bgMode);
         glUniform1f(uCheckerSizeLoc, 24.0f);
         glUniform1i(uPixelGridLoc, pixelGrid ? 1 : 0);
+        glUniform1i(uInvertLoc, invert ? 1 : 0);
+        glUniform1i(uChannelsLoc, channelMask);
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, textureID);

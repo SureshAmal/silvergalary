@@ -7,6 +7,15 @@
 //   * JPEG  -> libjpeg-turbo (DCT-scaled decoding for thumbnails)   [HAVE_TURBOJPEG]
 //   * WebP  -> libwebp (native scaled decoding)                     [HAVE_WEBP]
 //   * AVIF  -> libavif                                              [HAVE_AVIF]
+//   * HEIC  -> libheif                                              [HAVE_HEIF]
+//   * JXL   -> libjxl                                               [HAVE_JXL]
+//   * TIFF  -> libtiff                                              [HAVE_TIFF]
+//   * RAW   -> LibRaw (40+ camera formats)                          [HAVE_RAW]
+//
+// Colour management: when an image carries an embedded ICC profile it is
+// converted to sRGB on load [HAVE_LCMS]. Without this a Display P3 or Adobe RGB
+// photo is shown by treating its numbers as sRGB, which is not a missing
+// feature but a wrong picture - saturated colours drift noticeably.
 //   * SVG   -> nanosvg (vendored, always available)
 //   * rest  -> stb_image
 //
@@ -34,6 +43,21 @@
 #include <webp/decode.h>
 #endif
 
+#ifdef HAVE_HEIF
+#include <libheif/heif.h>
+#endif
+#ifdef HAVE_JXL
+#include <jxl/decode.h>
+#endif
+#ifdef HAVE_TIFF
+#include <tiffio.h>
+#endif
+#ifdef HAVE_RAW
+#include <libraw/libraw.h>
+#endif
+#ifdef HAVE_LCMS
+#include <lcms2.h>
+#endif
 #ifdef HAVE_AVIF
 #include <avif/avif.h>
 #endif
@@ -54,6 +78,10 @@ enum Format {
     FMT_SVG,
     FMT_GIF,
     FMT_BMP,
+    FMT_HEIF,
+    FMT_JXL,
+    FMT_TIFF,
+    FMT_RAW,
     FMT_OTHER
 };
 
@@ -82,7 +110,14 @@ inline bool isSupportedExtension(const std::string& extWithDot) {
     static const char* kExts[] = {
         ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".bmp", ".gif",
         ".tga", ".ppm", ".pgm", ".pnm", ".psd", ".hdr", ".pic",
-        ".svg", ".svgz", ".ico", ".avif"
+        ".svg", ".svgz", ".ico", ".avif",
+        ".heic", ".heif", ".hif", ".jxl", ".tif", ".tiff",
+        // Camera RAW. Decoded through LibRaw when it is available; without it
+        // these are simply never offered, which is better than listing a format
+        // the app then fails to open.
+        ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".dng",
+        ".orf", ".raf", ".rw2", ".raw", ".pef", ".erf", ".3fr", ".dcr", ".kdc",
+        ".mos", ".mrw", ".x3f", ".iiq"
     };
 
     std::string lower = extWithDot;
@@ -108,6 +143,26 @@ inline Format detectFormat(const std::string& path) {
     if (got >= 12 && memcmp(sig, "RIFF", 4) == 0 && memcmp(sig + 8, "WEBP", 4) == 0) return FMT_WEBP;
     if (got >= 12 && memcmp(sig + 4, "ftyp", 4) == 0) {
         if (memcmp(sig + 8, "avif", 4) == 0 || memcmp(sig + 8, "avis", 4) == 0) return FMT_AVIF;
+        // HEIF shares the ISO base-media container with AVIF; the brand is what
+        // separates them.
+        if (memcmp(sig + 8, "heic", 4) == 0 || memcmp(sig + 8, "heix", 4) == 0 ||
+            memcmp(sig + 8, "hevc", 4) == 0 || memcmp(sig + 8, "heim", 4) == 0 ||
+            memcmp(sig + 8, "heis", 4) == 0 || memcmp(sig + 8, "mif1", 4) == 0 ||
+            memcmp(sig + 8, "msf1", 4) == 0) return FMT_HEIF;
+    }
+    // JPEG XL has two containers: the bare codestream and the ISOBMFF box form.
+    if (got >= 2 && sig[0] == 0xFF && sig[1] == 0x0A) return FMT_JXL;
+    if (got >= 12 && memcmp(sig, "\x00\x00\x00\x0CJXL \r\n\x87\n", 12) == 0) return FMT_JXL;
+    if (got >= 4 && (memcmp(sig, "II*\x00", 4) == 0 || memcmp(sig, "MM\x00*", 4) == 0)) {
+        // Most camera RAWs are TIFF containers, so the extension decides which
+        // decoder gets it; a plain .tif falls through to libtiff.
+        std::string rawExt = lowerExtension(path);
+        static const char* kRawExts[] = {
+            "cr2","cr3","crw","nef","nrw","arw","srf","sr2","dng","orf","raf",
+            "rw2","raw","pef","erf","3fr","dcr","kdc","mos","mrw","x3f","iiq"
+        };
+        for (const char* e : kRawExts) if (rawExt == e) return FMT_RAW;
+        return FMT_TIFF;
     }
     if (got >= 6 && memcmp(sig, "GIF8", 4) == 0) return FMT_GIF;
     if (got >= 2 && sig[0] == 'B' && sig[1] == 'M') return FMT_BMP;
@@ -124,7 +179,159 @@ inline Format detectFormat(const std::string& path) {
     if (ext == "png") return FMT_PNG;
     if (ext == "webp") return FMT_WEBP;
     if (ext == "avif") return FMT_AVIF;
+    if (ext == "heic" || ext == "heif" || ext == "hif") return FMT_HEIF;
+    if (ext == "jxl") return FMT_JXL;
+    if (ext == "tif" || ext == "tiff") return FMT_TIFF;
+    {
+        static const char* kRawExts[] = {
+            "cr2","cr3","crw","nef","nrw","arw","srf","sr2","dng","orf","raf",
+            "rw2","raw","pef","erf","3fr","dcr","kdc","mos","mrw","x3f","iiq"
+        };
+        for (const char* e : kRawExts) if (ext == e) return FMT_RAW;
+    }
     return FMT_OTHER;
+}
+
+
+// ---------------------------------------------------------------------------
+// Embedded ICC profiles
+// ---------------------------------------------------------------------------
+
+inline bool readWholeFile(const std::string& path, std::vector<unsigned char>& out);
+
+// Runtime switch, set once from config at startup. This header stays free of a
+// config dependency the same way gifMaxFrames() does - the codec layer should
+// not know where its settings come from.
+inline bool& colorManagementEnabled() {
+    static bool enabled = true;
+    return enabled;
+}
+
+// JPEG stores a profile in one or more APP2 segments tagged "ICC_PROFILE\0",
+// each carrying a sequence number, because a segment caps at 64 KB. They have to
+// be concatenated in order.
+inline bool extractIccJpeg(const std::vector<unsigned char>& buf, std::vector<unsigned char>& out) {
+    out.clear();
+    if (buf.size() < 4 || buf[0] != 0xFF || buf[1] != 0xD8) return false;
+
+    // Chunks can arrive out of order; index them by sequence number first.
+    std::vector<std::vector<unsigned char>> chunks;
+    size_t i = 2;
+    while (i + 4 <= buf.size()) {
+        if (buf[i] != 0xFF) { ++i; continue; }
+        unsigned char marker = buf[i + 1];
+        if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) { i += 2; continue; }
+        if (marker == 0xDA || marker == 0xD9) break;          // scan data: no more metadata
+        if (i + 4 > buf.size()) break;
+        size_t len = ((size_t)buf[i + 2] << 8) | buf[i + 3];
+        if (len < 2 || i + 2 + len > buf.size()) break;
+
+        if (marker == 0xE2 && len >= 2 + 12 + 2) {
+            const unsigned char* seg = buf.data() + i + 4;
+            if (memcmp(seg, "ICC_PROFILE\0", 12) == 0) {
+                int seq = seg[12], total = seg[13];
+                if (seq >= 1 && total >= 1) {
+                    if ((int)chunks.size() < total) chunks.resize(total);
+                    const unsigned char* payload = seg + 14;
+                    size_t payloadLen = len - 2 - 14;
+                    chunks[(size_t)seq - 1].assign(payload, payload + payloadLen);
+                }
+            }
+        }
+        i += 2 + len;
+    }
+    for (const auto& c : chunks) out.insert(out.end(), c.begin(), c.end());
+    return !out.empty();
+}
+
+// PNG keeps the profile in an iCCP chunk: a null-terminated name, a compression
+// byte, then zlib-deflated profile data.
+inline bool extractIccPng(const std::vector<unsigned char>& buf, std::vector<unsigned char>& out) {
+    out.clear();
+    if (buf.size() < 8) return false;
+    size_t i = 8;
+    while (i + 8 <= buf.size()) {
+        uint32_t len = ((uint32_t)buf[i] << 24) | ((uint32_t)buf[i+1] << 16) |
+                       ((uint32_t)buf[i+2] << 8) | (uint32_t)buf[i+3];
+        const unsigned char* type = buf.data() + i + 4;
+        size_t dataAt = i + 8;
+        if (dataAt + len + 4 > buf.size()) break;
+
+        if (memcmp(type, "iCCP", 4) == 0) {
+            size_t p = dataAt, endName = dataAt + len;
+            while (p < endName && buf[p] != 0) ++p;
+            if (p + 2 <= endName) {
+                const char* comp = (const char*)(buf.data() + p + 2);
+                int compLen = (int)(endName - (p + 2));
+                int outLen = 0;
+                char* raw = stbi_zlib_decode_malloc(comp, compLen, &outLen);
+                if (raw && outLen > 0) {
+                    out.assign((unsigned char*)raw, (unsigned char*)raw + outLen);
+                    free(raw);
+                    return true;
+                }
+                if (raw) free(raw);
+            }
+            return false;
+        }
+        if (memcmp(type, "IDAT", 4) == 0 || memcmp(type, "IEND", 4) == 0) break;
+        i = dataAt + len + 4;
+    }
+    return false;
+}
+
+inline bool extractIccProfile(const std::string& path, Format fmt,
+                              std::vector<unsigned char>& out) {
+    if (fmt != FMT_JPEG && fmt != FMT_PNG) return false;
+    std::vector<unsigned char> buf;
+    if (!readWholeFile(path, buf)) return false;
+    return (fmt == FMT_JPEG) ? extractIccJpeg(buf, out) : extractIccPng(buf, out);
+}
+
+// Convert in place to sRGB. A no-op when the profile is missing, unreadable, or
+// already sRGB - converting sRGB to sRGB would only cost time and rounding.
+inline bool convertToSRGB(unsigned char* pixels, int w, int h,
+                          const std::vector<unsigned char>& profile) {
+#ifdef HAVE_LCMS
+    if (!pixels || w <= 0 || h <= 0 || profile.size() < 128) return false;
+
+    cmsHPROFILE src = cmsOpenProfileFromMem(profile.data(), (cmsUInt32Number)profile.size());
+    if (!src) return false;
+    cmsHPROFILE dst = cmsCreate_sRGBProfile();
+    if (!dst) { cmsCloseProfile(src); return false; }
+
+    // Perceptual would re-map the whole image; relative colorimetric with black
+    // point compensation keeps in-gamut colours where the author put them.
+    cmsHTRANSFORM xform = cmsCreateTransform(src, TYPE_RGBA_8, dst, TYPE_RGBA_8,
+                                             INTENT_RELATIVE_COLORIMETRIC,
+                                             cmsFLAGS_BLACKPOINTCOMPENSATION |
+                                             cmsFLAGS_COPY_ALPHA);
+    bool ok = false;
+    if (xform) {
+        cmsDoTransform(xform, pixels, pixels, (cmsUInt32Number)((size_t)w * h));
+        cmsDeleteTransform(xform);
+        ok = true;
+    }
+    cmsCloseProfile(dst);
+    cmsCloseProfile(src);
+    return ok;
+#else
+    (void)pixels; (void)w; (void)h; (void)profile;
+    return false;
+#endif
+}
+
+// Decode-time hook: pull any embedded profile and normalise to sRGB.
+inline void applyColorManagement(const std::string& path, Format fmt,
+                                 unsigned char* pixels, int w, int h) {
+#ifdef HAVE_LCMS
+    if (!colorManagementEnabled()) return;
+    std::vector<unsigned char> profile;
+    if (!extractIccProfile(path, fmt, profile)) return;
+    convertToSRGB(pixels, w, h, profile);
+#else
+    (void)path; (void)fmt; (void)pixels; (void)w; (void)h;
+#endif
 }
 
 // Box-average by an integer factor. Cheap, cache friendly, and it does most of
@@ -381,7 +588,15 @@ inline unsigned char* loadRGBAKnown(const std::string& path, Format fmt,
                                     int* outW, int* outH, int* outComp);
 
 inline unsigned char* loadRGBA(const std::string& path, int* outW, int* outH, int* outComp) {
-    return loadRGBAKnown(path, detectFormat(path), outW, outH, outComp);
+    Format fmt = detectFormat(path);
+    int w = 0, h = 0;
+    unsigned char* pixels = loadRGBAKnown(path, fmt, &w, &h, outComp);
+    // Normalise to sRGB once, here, so every caller downstream - viewer,
+    // thumbnails, previews - is working in the same colour space.
+    if (pixels) applyColorManagement(path, fmt, pixels, w, h);
+    if (outW) *outW = w;
+    if (outH) *outH = h;
+    return pixels;
 }
 
 // Same, but for callers that already sniffed the format - detectFormat opens
@@ -437,6 +652,165 @@ inline unsigned char* loadRGBAKnown(const std::string& path, Format fmt,
         if (outW) *outW = w;
         if (outH) *outH = h;
         if (outComp) *outComp = 4;
+        return pixels;
+    }
+#endif
+
+#ifdef HAVE_HEIF
+    if (fmt == FMT_HEIF) {
+        heif_context* ctx = heif_context_alloc();
+        if (!ctx) return nullptr;
+        unsigned char* pixels = nullptr;
+        if (heif_context_read_from_file(ctx, path.c_str(), nullptr).code == heif_error_Ok) {
+            heif_image_handle* handle = nullptr;
+            if (heif_context_get_primary_image_handle(ctx, &handle).code == heif_error_Ok && handle) {
+                heif_image* img = nullptr;
+                if (heif_decode_image(handle, &img, heif_colorspace_RGB,
+                                      heif_chroma_interleaved_RGBA, nullptr).code == heif_error_Ok && img) {
+                    int w = heif_image_get_width(img, heif_channel_interleaved);
+                    int h = heif_image_get_height(img, heif_channel_interleaved);
+                    int stride = 0;
+                    const uint8_t* src = heif_image_get_plane_readonly(img, heif_channel_interleaved, &stride);
+                    if (src && w > 0 && h > 0) {
+                        pixels = (unsigned char*)malloc((size_t)w * h * 4);
+                        if (pixels) {
+                            // The decoder's stride is its own; never assume w*4.
+                            for (int y = 0; y < h; ++y)
+                                memcpy(pixels + (size_t)y * w * 4, src + (size_t)y * stride, (size_t)w * 4);
+                            if (outW) *outW = w;
+                            if (outH) *outH = h;
+                            if (outComp) *outComp = 4;
+                        }
+                    }
+                    heif_image_release(img);
+                }
+                heif_image_handle_release(handle);
+            }
+        }
+        heif_context_free(ctx);
+        return pixels;
+    }
+#endif
+
+#ifdef HAVE_JXL
+    if (fmt == FMT_JXL) {
+        std::vector<unsigned char> buf;
+        if (!readWholeFile(path, buf)) return nullptr;
+
+        JxlDecoder* dec = JxlDecoderCreate(nullptr);
+        if (!dec) return nullptr;
+        unsigned char* pixels = nullptr;
+
+        if (JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE) == JXL_DEC_SUCCESS) {
+            JxlDecoderSetInput(dec, buf.data(), buf.size());
+            JxlDecoderCloseInput(dec);
+
+            JxlBasicInfo info{};
+            JxlPixelFormat pf{ 4, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0 };
+            size_t needed = 0;
+            bool done = false;
+            while (!done) {
+                JxlDecoderStatus st = JxlDecoderProcessInput(dec);
+                if (st == JXL_DEC_BASIC_INFO) {
+                    if (JxlDecoderGetBasicInfo(dec, &info) != JXL_DEC_SUCCESS) break;
+                } else if (st == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+                    if (JxlDecoderImageOutBufferSize(dec, &pf, &needed) != JXL_DEC_SUCCESS) break;
+                    pixels = (unsigned char*)malloc(needed);
+                    if (!pixels) break;
+                    if (JxlDecoderSetImageOutBuffer(dec, &pf, pixels, needed) != JXL_DEC_SUCCESS) {
+                        free(pixels); pixels = nullptr; break;
+                    }
+                } else if (st == JXL_DEC_FULL_IMAGE) {
+                    if (outW) *outW = (int)info.xsize;
+                    if (outH) *outH = (int)info.ysize;
+                    if (outComp) *outComp = 4;
+                    done = true;
+                } else {
+                    // SUCCESS means the stream ended; anything else is an error.
+                    if (st != JXL_DEC_SUCCESS && pixels) { free(pixels); pixels = nullptr; }
+                    done = true;
+                }
+            }
+        }
+        JxlDecoderDestroy(dec);
+        return pixels;
+    }
+#endif
+
+#ifdef HAVE_TIFF
+    if (fmt == FMT_TIFF) {
+        TIFF* tif = TIFFOpen(path.c_str(), "r");
+        if (!tif) return nullptr;
+        uint32_t w = 0, h = 0;
+        TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &w);
+        TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &h);
+        unsigned char* pixels = nullptr;
+        if (w > 0 && h > 0 && (uint64_t)w * h < (uint64_t)1 << 30) {
+            pixels = (unsigned char*)malloc((size_t)w * h * 4);
+            if (pixels) {
+                // ORIENTATION_TOPLEFT so the result matches every other decoder
+                // here; TIFFReadRGBAImage alone returns bottom-up.
+                if (!TIFFReadRGBAImageOriented(tif, w, h, (uint32_t*)pixels,
+                                               ORIENTATION_TOPLEFT, 0)) {
+                    free(pixels);
+                    pixels = nullptr;
+                } else {
+                    // libtiff packs ABGR in a uint32; unpack to byte-order RGBA.
+                    uint32_t* px = (uint32_t*)pixels;
+                    size_t n = (size_t)w * h;
+                    for (size_t i = 0; i < n; ++i) {
+                        uint32_t v = px[i];
+                        unsigned char* o = pixels + i * 4;
+                        o[0] = (unsigned char)TIFFGetR(v);
+                        o[1] = (unsigned char)TIFFGetG(v);
+                        o[2] = (unsigned char)TIFFGetB(v);
+                        o[3] = (unsigned char)TIFFGetA(v);
+                    }
+                    if (outW) *outW = (int)w;
+                    if (outH) *outH = (int)h;
+                    if (outComp) *outComp = 4;
+                }
+            }
+        }
+        TIFFClose(tif);
+        return pixels;
+    }
+#endif
+
+#ifdef HAVE_RAW
+    if (fmt == FMT_RAW) {
+        LibRaw raw;
+        if (raw.open_file(path.c_str()) != LIBRAW_SUCCESS) return nullptr;
+        unsigned char* pixels = nullptr;
+        if (raw.unpack() == LIBRAW_SUCCESS) {
+            // Half-size demosaic: a RAW is 20-50 MP and this is feeding a viewer,
+            // not a darkroom. It is roughly 4x faster and still far above what
+            // any thumbnail tier needs.
+            raw.imgdata.params.half_size = 1;
+            raw.imgdata.params.use_camera_wb = 1;
+            raw.imgdata.params.output_bps = 8;
+            if (raw.dcraw_process() == LIBRAW_SUCCESS) {
+                int err = 0;
+                libraw_processed_image_t* img = raw.dcraw_make_mem_image(&err);
+                if (img && img->type == LIBRAW_IMAGE_BITMAP && img->bits == 8 && img->colors == 3) {
+                    size_t n = (size_t)img->width * img->height;
+                    pixels = (unsigned char*)malloc(n * 4);
+                    if (pixels) {
+                        for (size_t i = 0; i < n; ++i) {
+                            pixels[i * 4 + 0] = img->data[i * 3 + 0];
+                            pixels[i * 4 + 1] = img->data[i * 3 + 1];
+                            pixels[i * 4 + 2] = img->data[i * 3 + 2];
+                            pixels[i * 4 + 3] = 255;
+                        }
+                        if (outW) *outW = img->width;
+                        if (outH) *outH = img->height;
+                        if (outComp) *outComp = 4;
+                    }
+                }
+                if (img) LibRaw::dcraw_clear_mem(img);
+            }
+        }
+        raw.recycle();
         return pixels;
     }
 #endif

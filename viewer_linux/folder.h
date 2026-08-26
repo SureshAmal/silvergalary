@@ -130,6 +130,17 @@ public:
         return true;
     }
 
+    // Drop the current entry and land on a valid neighbour. Returns false when
+    // the folder is now empty, which the caller must treat as "nothing to show"
+    // rather than navigating to a stale path.
+    bool removeCurrentAndAdvance() {
+        if (!hasFiles()) return false;
+        fileList.erase(fileList.begin() + currentIndex);
+        if (fileList.empty()) { currentIndex = -1; return false; }
+        if (currentIndex >= (int)fileList.size()) currentIndex = (int)fileList.size() - 1;
+        return true;
+    }
+
     bool jumpTo(int idx) {
         if (idx >= 0 && idx < (int)fileList.size()) {
             currentIndex = idx;

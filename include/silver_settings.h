@@ -42,6 +42,51 @@ struct SettingSpec {
 inline const std::vector<SettingSpec>& settingsSchema() {
     static const std::vector<SettingSpec> schema = {
         // ---- Appearance ------------------------------------------------------
+        { "Appearance", "rendering.colorManagement", "Colour Management",
+          "Convert images carrying an embedded ICC profile to sRGB. Off shows their raw numbers, which is wrong for Display P3 and Adobe RGB photos.",
+          SETTING_TOGGLE },
+
+        { "Slideshow", "slideshow.intervalSeconds", "Slide Duration",
+          "Seconds each photo is shown. F5 starts and stops a slideshow; Space pauses it.",
+          SETTING_SLIDER, 1.0f, 30.0f, 1.0f },
+
+        { "Slideshow", "slideshow.randomInterval", "Vary The Timing",
+          "Randomise each delay instead of using a fixed cadence, so the pacing is less metronomic.",
+          SETTING_TOGGLE },
+
+        { "Slideshow", "slideshow.shuffle", "Shuffle",
+          "Pick the next photo at random rather than walking the folder in order.",
+          SETTING_TOGGLE },
+
+        { "Slideshow", "slideshow.loop", "Loop",
+          "Return to the first photo after the last one instead of stopping.",
+          SETTING_TOGGLE },
+
+        { "Slideshow", "slideshow.fullscreen", "Start Fullscreen",
+          "Enter fullscreen automatically when a slideshow begins.",
+          SETTING_TOGGLE },
+
+        { "Library", "library.sortBy", "Sort Photos By",
+          "Order photos are listed in. The timeline still groups by date; this sets the order within each group.",
+          SETTING_CHOICE, 0, 0, 0,
+          { { "taken", "Date taken" }, { "modified", "Date modified" },
+            { "name", "File name" }, { "size", "File size" }, { "random", "Random" } } },
+
+        { "Library", "library.sortAscending", "Oldest First",
+          "Reverse the sort. Off puts the newest and largest first, which is what a photo library usually wants.",
+          SETTING_TOGGLE },
+
+        { "Appearance", "theme.name", "Theme",
+          "The design language the interface is drawn in. Each theme carries its own colour, shape, motion and typography.",
+          SETTING_CHOICE, 0, 0, 0,
+          { { "material-expressive", "Material 3 Expressive" },
+            { "classic-slate", "Classic Slate" } } },
+
+        { "Appearance", "theme.mode", "Appearance Mode",
+          "Follow the desktop's light/dark preference, or pin one.",
+          SETTING_CHOICE, 0, 0, 0,
+          { { "system", "System" }, { "dark", "Dark" }, { "light", "Light" } } },
+
         { "Appearance", "text.pixelSize", "Font Size",
           "Size of all interface text. The rest of the interface scales with it.",
           SETTING_STEPPER, 12, 24, 1 },
@@ -55,9 +100,9 @@ inline const std::vector<SettingSpec>& settingsSchema() {
           "Thickness of icon strokes. Raise it if icons look too light next to text.",
           SETTING_SLIDER, 0.75f, 2.0f, 0.05f },
 
-        { "Appearance", "grid.tileRadius", "Rounded Corners",
-          "Corner rounding applied to photo tiles and cards.",
-          SETTING_SLIDER, 0.0f, 24.0f, 1.0f },
+        { "Appearance", "theme.overrides.shape.medium", "Rounded Corners",
+          "Corner rounding for tiles, cards and panels. Overrides the active theme's medium shape tier.",
+          SETTING_SLIDER, 0.0f, 32.0f, 1.0f },
 
         { "Appearance", "grid.gap", "Grid Spacing",
           "Space between photos in the grid.",

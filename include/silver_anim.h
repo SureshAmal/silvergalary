@@ -16,10 +16,16 @@
 // -----------------------------------------------------------------------------
 
 #include "silver_config.h"
+#include "silver_theme.h"
 #include <cmath>
 #include <algorithm>
 
 namespace silveranim {
+
+// A theme supplies the *default* spring for each channel; animation.spring.<key>
+// in the config still overrides any of them individually. Passing nullptr keeps
+// the built-in defaults, which is what callers that run before the theme exists
+// (very early startup) do.
 
 // -----------------------------------------------------------------------------
 // Second-order dynamic spring
@@ -77,6 +83,7 @@ struct Rates {
     float layoutGlide = 26.0f;      // tiles sliding to a new grid slot
     float hover = 24.0f;            // tile hover lift / caption fade
     float select = 24.0f;           // selection ring fade
+    float press = 34.0f;            // press-in shape morph / state layer
     float sidebar = 20.0f;          // FilePilot slide in/out
     float fullscreen = 20.0f;       // lightbox open/close
     float zoomPopup = 24.0f;        // zoom HUD
@@ -100,7 +107,7 @@ struct Rates {
     // "spring" (second-order physics) or "exponential" (plain smoothing).
     bool useSpring = true;
 
-    Channel chScroll, chLayout, chHover, chSelect, chSidebar, chFullscreen;
+    Channel chScroll, chLayout, chHover, chSelect, chPress, chSidebar, chFullscreen;
     Channel chZoomPopup, chThemeMenu, chTabIndicator, chFilmstrip;
 
     // SilverViewer channels
@@ -117,7 +124,7 @@ inline Rates& rates() {
 
 // Pull the "animation" block out of the config. Safe to call repeatedly (the
 // config hot-reloads, so this runs again whenever the file changes).
-inline void reloadFromConfig() {
+inline void reloadFromConfig(const ThemeMotion* motion = nullptr) {
     const SilverConfig& c = SilverConfig::get();
     Rates& r = rates();
 
@@ -128,6 +135,7 @@ inline void reloadFromConfig() {
     r.layoutGlide            = c.num("animation.layoutGlideRate", 26.0f);
     r.hover                  = c.num("animation.hoverRate", 24.0f);
     r.select                 = c.num("animation.selectRate", 24.0f);
+    r.press                  = c.num("animation.pressRate", 34.0f);
     r.sidebar                = c.num("animation.sidebarRate", 20.0f);
     r.fullscreen             = c.num("animation.fullscreenRate", 20.0f);
     r.zoomPopup              = c.num("animation.zoomPopupRate", 24.0f);
@@ -146,7 +154,9 @@ inline void reloadFromConfig() {
     r.useSpring = (c.text("animation.model", "spring") != "exponential");
 
     auto loadChannel = [&](Channel& ch, const char* key, float rate,
+                           const ThemeMotionSpec* themeSpec,
                            float f, float z, float resp) {
+        if (themeSpec) { f = themeSpec->frequency; z = themeSpec->damping; resp = themeSpec->response; }
         ch.rate = rate;
         std::string base = std::string("animation.spring.") + key + ".";
         ch.spring.frequency = c.num((base + "frequency").c_str(), f);
@@ -155,21 +165,32 @@ inline void reloadFromConfig() {
         ch.spring.rebuild();
     };
 
-    loadChannel(r.chLayout,       "tile",         r.layoutGlide,  3.0f, 1.00f,  0.0f);
-    loadChannel(r.chScroll,       "scroll",       r.scroll,       2.6f, 1.05f,  0.0f);
-    loadChannel(r.chSidebar,      "sidebar",      r.sidebar,      2.4f, 0.90f,  0.2f);
-    loadChannel(r.chFullscreen,   "fullscreen",   r.fullscreen,   3.2f, 0.95f,  0.1f);
-    loadChannel(r.chHover,        "hover",        r.hover,        4.0f, 0.85f,  0.0f);
-    loadChannel(r.chSelect,       "select",       r.select,       4.0f, 0.90f,  0.0f);
-    loadChannel(r.chZoomPopup,    "zoomPopup",    r.zoomPopup,    3.6f, 0.85f,  0.3f);
-    loadChannel(r.chThemeMenu,    "themeMenu",    r.themeMenu,    3.6f, 0.85f,  0.3f);
-    loadChannel(r.chTabIndicator, "tabIndicator", r.tabIndicator, 3.4f, 0.85f,  0.2f);
-    loadChannel(r.chFilmstrip,    "filmstrip",    r.filmstrip,    5.0f, 1.00f,  0.0f);
+    // Material splits motion in two: spatial springs move things and may
+    // overshoot, effect springs drive opacity and colour and never do.
+    const ThemeMotionSpec* spatialFast    = motion ? &motion->spatialFast    : nullptr;
+    const ThemeMotionSpec* spatialDefault = motion ? &motion->spatialDefault : nullptr;
+    const ThemeMotionSpec* spatialSlow    = motion ? &motion->spatialSlow    : nullptr;
+    const ThemeMotionSpec* effectsDefault = motion ? &motion->effectsDefault : nullptr;
+    const ThemeMotionSpec* effectsFast    = motion ? &motion->effectsFast    : nullptr;
 
-    loadChannel(r.chViewerTransform,  "viewerTransform",  24.0f, 3.4f, 1.00f, 0.0f);
-    loadChannel(r.chViewerChrome,     "viewerChrome",     14.0f, 2.6f, 1.00f, 0.0f);
-    loadChannel(r.chViewerPopup,      "viewerPopup",      22.0f, 3.6f, 0.85f, 0.3f);
-    loadChannel(r.chViewerGridScroll, "viewerGridScroll", 24.0f, 2.8f, 1.05f, 0.0f);
+    loadChannel(r.chLayout,       "tile",         r.layoutGlide, spatialDefault,  3.0f, 1.00f,  0.0f);
+    loadChannel(r.chScroll,       "scroll",       r.scroll, spatialDefault,       2.6f, 1.05f,  0.0f);
+    loadChannel(r.chSidebar,      "sidebar",      r.sidebar, spatialSlow,      2.4f, 0.90f,  0.2f);
+    loadChannel(r.chFullscreen,   "fullscreen",   r.fullscreen, spatialDefault,   3.2f, 0.95f,  0.1f);
+    loadChannel(r.chHover,        "hover",        r.hover, spatialFast,        4.0f, 0.85f,  0.0f);
+    loadChannel(r.chSelect,       "select",       r.select, effectsDefault,       4.0f, 0.90f,  0.0f);
+    // Press must arrive almost instantly and not wobble: a container that
+    // bounced back into shape would read as a glitch rather than a response.
+    loadChannel(r.chPress,        "press",        r.press, effectsFast,          6.0f, 1.00f,  0.0f);
+    loadChannel(r.chZoomPopup,    "zoomPopup",    r.zoomPopup, spatialFast,    3.6f, 0.85f,  0.3f);
+    loadChannel(r.chThemeMenu,    "themeMenu",    r.themeMenu, spatialFast,    3.6f, 0.85f,  0.3f);
+    loadChannel(r.chTabIndicator, "tabIndicator", r.tabIndicator, spatialFast, 3.4f, 0.85f,  0.2f);
+    loadChannel(r.chFilmstrip,    "filmstrip",    r.filmstrip, spatialDefault,    5.0f, 1.00f,  0.0f);
+
+    loadChannel(r.chViewerTransform,  "viewerTransform",  24.0f, spatialDefault, 3.4f, 1.00f, 0.0f);
+    loadChannel(r.chViewerChrome,     "viewerChrome",     14.0f, effectsDefault, 2.6f, 1.00f, 0.0f);
+    loadChannel(r.chViewerPopup,      "viewerPopup",      22.0f, spatialFast, 3.6f, 0.85f, 0.3f);
+    loadChannel(r.chViewerGridScroll, "viewerGridScroll", 24.0f, spatialDefault, 2.8f, 1.05f, 0.0f);
 }
 
 // -----------------------------------------------------------------------------

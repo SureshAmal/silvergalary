@@ -735,7 +735,7 @@ public:
             float badgeY2 = cropState.optReplaceRect.y + (optH - badgeSize) * 0.5f;
             Color4 badgeBg2 = pal.isDark ? Color4(0.90f, 0.55f, 0.10f, 0.22f) : Color4(0.95f, 0.55f, 0.10f, 0.15f);
             font.addRoundedRect(badgeX, badgeY2, badgeSize, badgeSize, 6.0f * uiScale, badgeBg2);
-            iconAtlas.drawIcon(font, ICON_REFRESH, badgeX + (badgeSize - optIconS) * 0.5f, badgeY2 + (badgeSize - optIconS) * 0.5f, optIconS, optIconS, Color4::Hex(0xF59E0B, 1.0f));
+            iconAtlas.drawIcon(font, ICON_REFRESH, badgeX + (badgeSize - optIconS) * 0.5f, badgeY2 + (badgeSize - optIconS) * 0.5f, optIconS, optIconS, pal.attention);
 
             font.addText(textX, cropState.optReplaceRect.y + 7.0f * uiScale, "Replace Original", pal.textPrimary);
             font.addText(textX, cropState.optReplaceRect.y + 25.0f * uiScale, "Overwrite current file directly", pal.textSecondary);
@@ -776,6 +776,9 @@ public:
     bool init(const char* fontPath = nullptr) {
         applyScale();
         theme.init();
+        // Re-run now that a theme exists: its motion scheme supplies the
+        // default spring for every animation channel.
+        silveranim::reloadFromConfig(&theme.tokens().motion);
         thumbs.init();
         iconAtlas.init();
         return font.init(fontPath, 14.0f);   // whole pixels: FreeType rounds anyway
@@ -1747,9 +1750,9 @@ public:
                 zoomMenuItemRects.clear();
 
                 font.beginBatch();
-                Color4 mCardBg = pal.isDark ? Color4::Hex(0x18191E, 0.98f) : Color4::Hex(0xFFFFFF, 0.98f);
+                Color4 mCardBg = pal.menuBg.withAlpha(0.98f);
                 mCardBg.a *= zoomMenuAnim;
-                Color4 mCardBorder = pal.isDark ? Color4::Hex(0x2E303C, 1.0f) : Color4::Hex(0xD0D7DE, 1.0f);
+                Color4 mCardBorder = pal.menuBorder.withAlpha(1.0f);
                 mCardBorder.a *= zoomMenuAnim;
 
                 // Menu Background & Shadow
@@ -1856,7 +1859,7 @@ public:
 
             // Header Bar
             float hdrH = 34.0f;
-            Color4 hdrBg = pal.isDark ? Color4::Hex(0x133038, 0.95f) : Color4::Hex(0xDBEAFE, 0.95f);
+            Color4 hdrBg = pal.accentSoft.withAlpha(0.95f);
             font.addRoundedRect(cardX, cardY, cardW, hdrH, 8.0f, hdrBg);
             font.addRect(cardX, cardY + hdrH - 6.0f, cardW, 6.0f, hdrBg);
             font.addRect(cardX, cardY + hdrH, cardW, 1.0f, pal.cardBorder);
@@ -2040,8 +2043,8 @@ public:
             // Background & Shadow
             font.beginBatch();
             font.addRoundedRect(tmX + 3, tmY + 4, tmW, tmH, 8.0f, Color4(0, 0, 0, 0.50f * tmAlpha));
-            font.addRoundedRect(tmX, tmY, tmW, tmH, 8.0f, pal.isDark ? Color4::Hex(0x181A20, 0.98f * tmAlpha) : Color4::Hex(0xFFFFFF, 0.98f * tmAlpha));
-            font.addRoundedBorder(tmX, tmY, tmW, tmH, 8.0f, 1.0f, pal.isDark ? Color4::Hex(0x2D323E, tmAlpha) : Color4::Hex(0xDFE2E8, tmAlpha));
+            font.addRoundedRect(tmX, tmY, tmW, tmH, theme.tokens().shape.medium, pal.menuBg.withAlpha(0.98f * tmAlpha));
+            font.addRoundedBorder(tmX, tmY, tmW, tmH, theme.tokens().shape.medium, 1.0f, pal.menuBorder.withAlpha(tmAlpha));
             font.render(windowW, windowH);
 
             struct ThemeOpt {
@@ -2073,7 +2076,7 @@ public:
 
                 if (isActive || to.rect->isHovered) {
                     font.beginBatch();
-                    Color4 bgCol = isActive ? pal.accent : (pal.isDark ? Color4::Hex(0x282B34, 0.85f * tmAlpha) : Color4::Hex(0xEEF0F4, 0.85f * tmAlpha));
+                    Color4 bgCol = isActive ? pal.accent : (pal.rowHover.withAlpha(0.85f * tmAlpha));
                     font.addRoundedRect(optX, optY, optW, optH, 6.0f, bgCol);
                     font.render(windowW, windowH);
                 }

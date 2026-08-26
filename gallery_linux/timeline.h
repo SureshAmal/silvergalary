@@ -28,14 +28,17 @@ struct TimelineItem {
     bool inAnimBand = false;     // close enough to the viewport to animate
     bool isHovered = false;
     bool isSelected = false;
+    bool isPressed = false;
     float hoverAnim = 0.0f;
     float selectAnim = 0.0f;
+    float pressAnim = 0.0f;      // 0..1, drives the Expressive shape morph
     uint64_t lastVisibleFrame = 0;
 
     // Spring state for the second-order motion solver.
     silveranim::RectVelocity motionVel;
     float hoverVel = 0.0f;
     float selectVel = 0.0f;
+    float pressVel = 0.0f;
 };
 
 struct TimelineSection {
@@ -84,6 +87,9 @@ public:
     float totalContentHeight = 0.0f;
     int totalPhotoCount = 0;
     std::string selectedPath = "";
+    // Path of the tile currently held down. Drives the Expressive press morph;
+    // set on mouse-down over a tile and cleared on release.
+    std::string pressedPath = "";
     int selectedFlatIndex = -1;
 
     int columns = 5;
@@ -838,11 +844,13 @@ public:
                                      mouseY >= curTop - scrollY && mouseY <= curBottom - scrollY &&
                                      mouseY > 60.0f);
                     itm.isSelected = (!selectedPath.empty() && itm.record.path == selectedPath);
+                    itm.isPressed = (!pressedPath.empty() && itm.record.path == pressedPath);
                     itm.lastVisibleFrame = visibilityFrame;
                     flatVisibleItems.push_back(&itm);
                 } else {
                     itm.isVisible = false;
                     itm.isHovered = false;
+                    itm.isPressed = false;
                     // Still inside the band: keep animating, just do not draw it.
                     if (!itm.inAnimBand) {
                         silveranim::snapRect(itm.animX, itm.animY, itm.animW, itm.animH,
@@ -853,6 +861,7 @@ public:
 
                 silveranim::driveFade(itm.hoverAnim, itm.hoverVel, itm.isHovered ? 1.0f : 0.0f, anim.chHover, dt);
                 silveranim::driveFade(itm.selectAnim, itm.selectVel, itm.isSelected ? 1.0f : 0.0f, anim.chSelect, dt);
+                silveranim::driveFade(itm.pressAnim, itm.pressVel, itm.isPressed ? 1.0f : 0.0f, anim.chPress, dt);
             }
         }
         if (regroupTransitionActive && !regroupStillMoving)
@@ -887,7 +896,8 @@ public:
                 std::abs(itm->animW - itm->w) > eps ||
                 std::abs(itm->animH - itm->h) > eps ||
                 std::abs(itm->hoverAnim - (itm->isHovered ? 1.0f : 0.0f)) > eps ||
-                std::abs(itm->selectAnim - (itm->isSelected ? 1.0f : 0.0f)) > eps) {
+                std::abs(itm->selectAnim - (itm->isSelected ? 1.0f : 0.0f)) > eps ||
+                std::abs(itm->pressAnim - (itm->isPressed ? 1.0f : 0.0f)) > eps) {
                 return true;
             }
         }

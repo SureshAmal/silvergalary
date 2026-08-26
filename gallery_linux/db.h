@@ -362,10 +362,36 @@ public:
         return true;
     }
 
+    // Sort field and direction. The timeline groups by date regardless, but the
+    // order within a group - and the order the viewer pages through - follows
+    // this.
+    enum SortField { SORT_DATE_TAKEN, SORT_DATE_MODIFIED, SORT_NAME, SORT_SIZE, SORT_RANDOM };
+
+    static const char* sortFieldKey(SortField f) {
+        switch (f) {
+            case SORT_DATE_MODIFIED: return "modified";
+            case SORT_NAME:          return "name";
+            case SORT_SIZE:          return "size";
+            case SORT_RANDOM:        return "random";
+            case SORT_DATE_TAKEN:    break;
+        }
+        return "taken";
+    }
+
+    static SortField sortFieldFromKey(const std::string& k) {
+        if (k == "modified") return SORT_DATE_MODIFIED;
+        if (k == "name")     return SORT_NAME;
+        if (k == "size")     return SORT_SIZE;
+        if (k == "random")   return SORT_RANDOM;
+        return SORT_DATE_TAKEN;
+    }
+
     std::vector<GalleryRecord> fetchAllSorted(const std::string& searchQuery = "",
                                               bool onlyStarred = false,
                                               const std::string& folderFilter = "",
-                                              bool folderRecursive = false) {
+                                              bool folderRecursive = false,
+                                              SortField sortField = SORT_DATE_TAKEN,
+                                              bool ascending = false) {
         std::vector<GalleryRecord> results;
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!db) return results;
@@ -387,7 +413,31 @@ public:
             sql += " AND (filename LIKE ? OR folder LIKE ? OR date_label LIKE ?) ";
         }
 
-        sql += " ORDER BY capture_time DESC, modified_time DESC, id DESC;";
+        // id is always the final tiebreaker so the order is total and stable -
+        // without it, equal keys come back in whatever order SQLite chooses and
+        // the grid can reshuffle between identical queries.
+        const char* dir = ascending ? "ASC" : "DESC";
+        switch (sortField) {
+            case SORT_DATE_MODIFIED:
+                sql += std::string(" ORDER BY modified_time ") + dir + ", id " + dir + ";";
+                break;
+            case SORT_NAME:
+                // NOCASE so "apple" and "Apple" sort together rather than by
+                // byte value, which would put every capitalised name first.
+                sql += std::string(" ORDER BY filename COLLATE NOCASE ") + dir + ", id " + dir + ";";
+                break;
+            case SORT_SIZE:
+                sql += std::string(" ORDER BY file_size ") + dir + ", id " + dir + ";";
+                break;
+            case SORT_RANDOM:
+                sql += " ORDER BY RANDOM();";
+                break;
+            case SORT_DATE_TAKEN:
+            default:
+                sql += std::string(" ORDER BY capture_time ") + dir +
+                       ", modified_time " + dir + ", id " + dir + ";";
+                break;
+        }
 
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
